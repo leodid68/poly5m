@@ -117,10 +117,8 @@ impl PolymarketClient {
         Ok(Self { http, api_key, api_secret_bytes, passphrase, signer, wallet_address })
     }
 
-    /// Trouve le marché 5min BTC actif pour la fenêtre courante.
-    pub async fn find_5min_btc_market(&self) -> Result<Market> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let window_ts = (now / 300) * 300;
+    /// Trouve le marché 5min BTC actif pour le window donné.
+    pub async fn find_5min_btc_market(&self, window_ts: u64) -> Result<Market> {
         let slug = format!("btc-updown-5m-{window_ts}");
         tracing::debug!(slug = %slug, "Looking up 5min BTC market");
 

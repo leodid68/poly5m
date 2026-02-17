@@ -125,28 +125,18 @@ async fn main() -> Result<()> {
     let mut current_window = 0u64;
     let mut start_price = 0.0f64;
     let mut traded_this_window = false;
-    // Cache marché pour le window courant (évite un appel Gamma par tick)
     let mut cached_market: Option<polymarket::Market> = None;
+    let mut pending_bet: Option<(f64, polymarket::Side, f64, f64)> = None; // (start_price, side, size, price)
 
     loop {
         interval.tick().await;
 
-        // Sample time once per iteration (avoid TOCTOU)
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let window = (now / 300) * 300;
         let window_end = window + 300;
         let remaining = window_end.saturating_sub(now);
 
-        // Détecter un nouvel intervalle 5min
-        if window != current_window {
-            current_window = window;
-            traded_this_window = false;
-            start_price = 0.0;
-            cached_market = None;
-            tracing::info!("--- Nouvel intervalle 5min (window={window}) ---");
-        }
-
-        // Fetch prix Chainlink (RACING parallèle sur tous les RPCs)
+        // Fetch Chainlink AVANT détection window (nécessaire pour résolution)
         let fetch_t = Instant::now();
         let price = match fetch_racing(&providers, feed).await {
             Ok(p) => p,
@@ -157,41 +147,53 @@ async fn main() -> Result<()> {
         };
         let fetch_ms = fetch_t.elapsed().as_millis();
 
-        // Staleness check — BTC/USD feed heartbeat = 3600s, seuil = 3700s
         if now > price.updated_at + 3700 {
             tracing::warn!("Chainlink stale: updated {}s ago", now - price.updated_at);
             continue;
         }
 
-        // Enregistrer le prix de début d'intervalle
-        if start_price == 0.0 {
+        // Nouvel intervalle 5min — résoudre le bet précédent
+        if window != current_window {
+            if let Some((bet_start, bet_side, bet_size, bet_price)) = pending_bet.take() {
+                let went_up = price.price_usd > bet_start;
+                let won = (went_up && bet_side == polymarket::Side::Buy)
+                    || (!went_up && bet_side != polymarket::Side::Buy);
+                let pnl = if won {
+                    bet_size * (1.0 / bet_price - 1.0)
+                } else {
+                    -bet_size
+                };
+                session.record_trade(pnl);
+                tracing::info!(
+                    "Résolution: {} | PnL: ${:.2} | Session: ${:.2} | WR: {:.0}%",
+                    if won { "WIN" } else { "LOSS" },
+                    pnl, session.pnl_usdc, session.win_rate() * 100.0,
+                );
+            }
+
+            current_window = window;
+            traded_this_window = false;
             start_price = price.price_usd;
-            tracing::info!("Prix début intervalle: ${:.2} (fetch: {}ms)", start_price, fetch_ms);
-        }
+            cached_market = None;
+            tracing::info!("--- Nouvel intervalle 5min (window={window}) | BTC: ${:.2} (fetch: {}ms) ---",
+                start_price, fetch_ms);
 
-        // Skip si déjà tradé ce window
-        if traded_this_window {
+            if session.pnl_usdc >= strat_config.session_profit_target_usdc
+                || session.pnl_usdc <= -strat_config.session_loss_limit_usdc
+            {
+                tracing::info!("Session limit atteint (PnL: ${:.2}). Arrêt.", session.pnl_usdc);
+                break;
+            }
             continue;
         }
 
-        // Pas dans la fenêtre d'entrée ? Skip
-        if remaining > strat_config.entry_seconds_before_end {
-            continue;
-        }
+        if traded_this_window { continue; }
+        if remaining > strat_config.entry_seconds_before_end { continue; }
 
-        // Session limits — graceful shutdown
-        if session.pnl_usdc >= strat_config.session_profit_target_usdc
-            || session.pnl_usdc <= -strat_config.session_loss_limit_usdc
-        {
-            tracing::info!("Session limit atteint (PnL: ${:.2}). Arrêt.", session.pnl_usdc);
-            break;
-        }
-
-        // --- Fenêtre d'entrée : fetch marché (cache) + midpoint en parallèle ---
+        // Fenêtre d'entrée : fetch marché (cache) + midpoint
         let (market, market_up_price) = if let Some(ref poly) = poly {
-            // Cache le marché pour tout le window (ne change pas intra-window)
             if cached_market.is_none() {
-                match poly.find_5min_btc_market().await {
+                match poly.find_5min_btc_market(current_window).await {
                     Ok(m) => cached_market = Some(m),
                     Err(e) => {
                         tracing::warn!("Marché introuvable: {e:#}");
@@ -212,20 +214,14 @@ async fn main() -> Result<()> {
             (None, 0.50)
         };
 
-        // Évaluer la stratégie
         let signal = match strategy::evaluate(
-            start_price,
-            price.price_usd,
-            market_up_price,
-            remaining,
-            &session,
-            &strat_config,
+            start_price, price.price_usd, market_up_price,
+            remaining, &session, &strat_config,
         ) {
             Some(s) => s,
             None => continue,
         };
 
-        // Déterminer le token à acheter
         let dummy_token = "dry-run-token".to_string();
         let token_id = match &market {
             Some(m) if signal.side == polymarket::Side::Buy => &m.token_id_yes,
@@ -241,12 +237,7 @@ async fn main() -> Result<()> {
         );
 
         if dry_run {
-            let potential_pnl = signal.size_usdc * (1.0 / signal.price - 1.0);
-            session.record_trade(potential_pnl);
-            tracing::info!(
-                "[DRY-RUN] Trade #{} | {} | PnL: ${:.2} | Session: ${:.2} | WR: {:.0}%",
-                session.trades, side_label, potential_pnl, session.pnl_usdc, session.win_rate() * 100.0,
-            );
+            pending_bet = Some((start_price, signal.side, signal.size_usdc, signal.price));
             traded_this_window = true;
         } else if let Some(ref poly) = poly {
             let order_t = Instant::now();
@@ -256,12 +247,7 @@ async fn main() -> Result<()> {
                     tracing::info!("Ordre placé: {} (status: {}) en {}ms",
                         result.order_id, result.status, order_ms);
                     if result.status == "matched" {
-                        let potential_pnl = signal.size_usdc * (1.0 / signal.price - 1.0);
-                        session.record_trade(potential_pnl);
-                        tracing::info!(
-                            "Trade #{} | PnL: ${:.2} | Session: ${:.2} | WR: {:.0}%",
-                            session.trades, potential_pnl, session.pnl_usdc, session.win_rate() * 100.0,
-                        );
+                        pending_bet = Some((start_price, signal.side, signal.size_usdc, signal.price));
                     } else {
                         tracing::warn!("Ordre non matched (status: {})", result.status);
                     }
