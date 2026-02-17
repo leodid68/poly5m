@@ -5,8 +5,9 @@ mod strategy;
 use alloy::primitives::Address;
 use alloy::providers::ProviderBuilder;
 use anyhow::{Context, Result};
+use futures::future::select_ok;
 use serde::Deserialize;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time;
 
 // --- Config ---
@@ -74,10 +75,11 @@ async fn main() -> Result<()> {
 
     let config = load_config()?;
     let dry_run = config.strategy.dry_run;
+    let poll_ms = config.chainlink.poll_interval_ms;
     let strat_config = strategy::StrategyConfig::from(config.strategy);
     let feed: Address = config.chainlink.btc_usd_feed.parse().context("Invalid feed address")?;
 
-    // Providers Chainlink (un par RPC URL, pour racing)
+    // Providers Chainlink — timeouts serrés pour le racing
     let providers = config.chainlink.rpc_urls.iter()
         .map(|url| {
             let url: reqwest::Url = url.parse().context("Invalid RPC URL in config")?;
@@ -96,7 +98,6 @@ async fn main() -> Result<()> {
         Ok(c) => Some(c),
         Err(e) if dry_run => {
             tracing::warn!("[DRY-RUN] Client Polymarket non initialisé: {e:#}");
-            tracing::warn!("[DRY-RUN] Utilisation d'un prix marché simulé (0.50)");
             None
         }
         Err(e) => return Err(e),
@@ -104,16 +105,28 @@ async fn main() -> Result<()> {
 
     tracing::info!("poly5m — Bot d'arbitrage Polymarket 5min BTC{}",
         if dry_run { " [DRY-RUN]" } else { "" });
-    tracing::info!("Config: max_bet=${} min_edge={}% entry={}s avant fin",
-        strat_config.max_bet_usdc, strat_config.min_edge_pct, strat_config.entry_seconds_before_end);
+    tracing::info!("Config: max_bet=${} min_edge={}% entry={}s avant fin | {} RPCs",
+        strat_config.max_bet_usdc, strat_config.min_edge_pct,
+        strat_config.entry_seconds_before_end, providers.len());
+
+    // --- Pre-warm : établit TCP+TLS vers tous les endpoints ---
+    tracing::info!("Pre-warming connections...");
+    let warmup_t = Instant::now();
+    let _ = fetch_racing(&providers, feed).await; // Chainlink RPC
+    if let Some(ref p) = poly {
+        let _ = p.get_midpoint("0").await; // Polymarket CLOB (force TCP+TLS)
+    }
+    tracing::info!("Pre-warm done in {}ms", warmup_t.elapsed().as_millis());
 
     let mut session = strategy::Session::default();
-    let mut interval = time::interval(Duration::from_millis(config.chainlink.poll_interval_ms));
+    let mut interval = time::interval(Duration::from_millis(poll_ms));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
     let mut current_window = 0u64;
     let mut start_price = 0.0f64;
     let mut traded_this_window = false;
+    // Cache marché pour le window courant (évite un appel Gamma par tick)
+    let mut cached_market: Option<polymarket::Market> = None;
 
     loop {
         interval.tick().await;
@@ -129,17 +142,20 @@ async fn main() -> Result<()> {
             current_window = window;
             traded_this_window = false;
             start_price = 0.0;
+            cached_market = None;
             tracing::info!("--- Nouvel intervalle 5min (window={window}) ---");
         }
 
-        // Fetch prix Chainlink (fallback séquentiel)
-        let price = match fetch_with_fallback(&providers, feed).await {
+        // Fetch prix Chainlink (RACING parallèle sur tous les RPCs)
+        let fetch_t = Instant::now();
+        let price = match fetch_racing(&providers, feed).await {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("Chainlink fetch error: {e:#}");
                 continue;
             }
         };
+        let fetch_ms = fetch_t.elapsed().as_millis();
 
         // Staleness check — BTC/USD feed heartbeat = 3600s, seuil = 3700s
         if now > price.updated_at + 3700 {
@@ -150,7 +166,7 @@ async fn main() -> Result<()> {
         // Enregistrer le prix de début d'intervalle
         if start_price == 0.0 {
             start_price = price.price_usd;
-            tracing::info!("Prix début intervalle: ${:.2}", start_price);
+            tracing::info!("Prix début intervalle: ${:.2} (fetch: {}ms)", start_price, fetch_ms);
         }
 
         // Skip si déjà tradé ce window
@@ -171,15 +187,19 @@ async fn main() -> Result<()> {
             break;
         }
 
-        // Chercher le marché et le prix mid
+        // --- Fenêtre d'entrée : fetch marché (cache) + midpoint en parallèle ---
         let (market, market_up_price) = if let Some(ref poly) = poly {
-            let market = match poly.find_5min_btc_market().await {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::warn!("Marché introuvable: {e:#}");
-                    continue;
+            // Cache le marché pour tout le window (ne change pas intra-window)
+            if cached_market.is_none() {
+                match poly.find_5min_btc_market().await {
+                    Ok(m) => cached_market = Some(m),
+                    Err(e) => {
+                        tracing::warn!("Marché introuvable: {e:#}");
+                        continue;
+                    }
                 }
-            };
+            }
+            let market = cached_market.as_ref().unwrap();
             let mid = match poly.get_midpoint(&market.token_id_yes).await {
                 Ok(p) => p,
                 Err(e) => {
@@ -187,9 +207,8 @@ async fn main() -> Result<()> {
                     continue;
                 }
             };
-            (Some(market), mid)
+            (Some(market.clone()), mid)
         } else {
-            // Dry-run sans credentials: prix marché simulé à 0.50
             (None, 0.50)
         };
 
@@ -216,39 +235,40 @@ async fn main() -> Result<()> {
 
         let side_label = if signal.side == polymarket::Side::Buy { "BUY UP" } else { "BUY DOWN" };
         tracing::info!(
-            "{}Placement ordre: {} {} ${:.2} @ {:.4}",
+            "{}Placement ordre: {} ${:.2} @ {:.4} (fetch: {}ms)",
             if dry_run { "[DRY-RUN] " } else { "" },
-            side_label, token_id, signal.size_usdc, signal.price,
+            side_label, signal.size_usdc, signal.price, fetch_ms,
         );
 
         if dry_run {
-            // Dry-run: assume matched, track PnL potentiel
             let potential_pnl = signal.size_usdc * (1.0 / signal.price - 1.0);
             session.record_trade(potential_pnl);
             tracing::info!(
-                "[DRY-RUN] Trade #{} | {} | PnL potentiel: ${:.2} | Session: ${:.2} | WR: {:.0}%",
+                "[DRY-RUN] Trade #{} | {} | PnL: ${:.2} | Session: ${:.2} | WR: {:.0}%",
                 session.trades, side_label, potential_pnl, session.pnl_usdc, session.win_rate() * 100.0,
             );
             traded_this_window = true;
         } else if let Some(ref poly) = poly {
-            // Toujours BUY — on varie le token (UP ou DOWN)
+            let order_t = Instant::now();
             match poly.place_order(token_id, polymarket::Side::Buy, signal.size_usdc, signal.price).await {
                 Ok(result) => {
-                    tracing::info!("Ordre placé: {} (status: {})", result.order_id, result.status);
+                    let order_ms = order_t.elapsed().as_millis();
+                    tracing::info!("Ordre placé: {} (status: {}) en {}ms",
+                        result.order_id, result.status, order_ms);
                     if result.status == "matched" {
                         let potential_pnl = signal.size_usdc * (1.0 / signal.price - 1.0);
                         session.record_trade(potential_pnl);
                         tracing::info!(
-                            "Trade #{} | PnL potentiel: ${:.2} | Session: ${:.2} | WR: {:.0}%",
+                            "Trade #{} | PnL: ${:.2} | Session: ${:.2} | WR: {:.0}%",
                             session.trades, potential_pnl, session.pnl_usdc, session.win_rate() * 100.0,
                         );
                     } else {
-                        tracing::warn!("Ordre non matched (status: {}), aucune position", result.status);
+                        tracing::warn!("Ordre non matched (status: {})", result.status);
                     }
                     traded_this_window = true;
                 }
                 Err(e) => {
-                    tracing::error!("Erreur placement ordre: {e:#}");
+                    tracing::error!("Erreur ordre: {e:#} ({}ms)", order_t.elapsed().as_millis());
                 }
             }
         }
@@ -257,20 +277,18 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Fetch prix Chainlink avec fallback séquentiel sur les providers.
-async fn fetch_with_fallback(
+/// Fetch prix Chainlink en RACING parallèle — prend la 1ère réponse.
+async fn fetch_racing(
     providers: &[impl alloy::providers::Provider + Sync],
     feed: Address,
 ) -> Result<chainlink::PriceData> {
-    let mut last_err = None;
-    for provider in providers {
-        match chainlink::fetch_price(provider, feed).await {
-            Ok(data) => return Ok(data),
-            Err(e) => {
-                tracing::debug!("RPC provider failed: {e:#}");
-                last_err = Some(e);
-            }
-        }
+    if providers.len() == 1 {
+        return chainlink::fetch_price(&providers[0], feed).await;
     }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("No providers")))
+    let futures: Vec<_> = providers.iter()
+        .map(|p| Box::pin(chainlink::fetch_price(p, feed)))
+        .collect();
+    let (result, _remaining) = select_ok(futures).await
+        .map_err(|e| anyhow::anyhow!("All RPC providers failed: {e}"))?;
+    Ok(result)
 }

@@ -108,8 +108,10 @@ impl PolymarketClient {
             .context("Invalid api_secret base64")?;
         let http = reqwest::Client::builder()
             .tcp_nodelay(true)
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(10))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(4)
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(3))
             .build()?;
 
         Ok(Self { http, api_key, api_secret_bytes, passphrase, signer, wallet_address })
