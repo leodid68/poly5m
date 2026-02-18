@@ -340,8 +340,8 @@ async fn main() -> Result<()> {
 
         last_mid = market_up_price;
 
-        // Fetch book for spread (before evaluate)
-        let book = if let Some(ref poly) = poly {
+        // Fetch book for spread (before evaluate) — always YES token
+        let spread_book = if let Some(ref poly) = poly {
             let token = cached_market.as_ref().map(|m| m.token_id_yes.as_str()).unwrap_or("0");
             poly.get_book(token).await.unwrap_or_default()
         } else {
@@ -352,7 +352,7 @@ async fn main() -> Result<()> {
         let signal = match strategy::evaluate(
             start_price, cl_price.unwrap_or(current_btc), ws_price, market_up_price,
             remaining, &session, &strat_config, fee_rate_bps, vol_tracker.current_vol(),
-            book.spread,
+            spread_book.spread,
         ) {
             Some(s) => s,
             None => {
@@ -375,11 +375,25 @@ async fn main() -> Result<()> {
             None => (&dummy_token, "YES"),
         };
 
+        // Fetch book for the ACTUAL token to get correct best_ask
+        let book = if let Some(ref poly) = poly {
+            poly.get_book(token_id).await.unwrap_or_default()
+        } else {
+            polymarket::BookData::default()
+        };
+
+        // Use best_ask as entry price (what taker actually pays), fallback to midpoint
+        let entry_price = if book.best_ask > 0.0 && book.best_ask <= 1.0 {
+            book.best_ask
+        } else {
+            signal.price // fallback to midpoint
+        };
+
         let side_label = if signal.side == polymarket::Side::Buy { "BUY_UP" } else { "BUY_DOWN" };
         tracing::info!(
             "{}Placement ordre: {} {} ${:.2} @ {:.4} | BTC=${:.2} ({num_ws} src) | spread={:.4} imbal={:.2}",
             if dry_run { "[DRY-RUN] " } else { "" },
-            side_label, token_label, signal.size_usdc, signal.price, current_btc,
+            side_label, token_label, signal.size_usdc, entry_price, current_btc,
             book.spread, book.imbalance,
         );
         if let Some(ref mut csv) = csv {
@@ -387,24 +401,24 @@ async fn main() -> Result<()> {
                 now, current_window, start_price, current_btc,
                 market_up_price, signal.implied_p_up, side_label, token_label,
                 signal.edge_brut_pct, signal.edge_pct, signal.fee_pct,
-                signal.size_usdc, signal.price, remaining, num_ws, vol_tracker.current_vol(),
+                signal.size_usdc, entry_price, remaining, num_ws, vol_tracker.current_vol(),
                 &macro_ctx, book.spread, book.bid_depth_usdc, book.ask_depth_usdc,
                 book.imbalance, book.num_bid_levels, book.num_ask_levels,
             );
         }
 
         if dry_run {
-            pending_bet = Some((start_price, signal.side, signal.size_usdc, signal.price, signal.fee_pct));
+            pending_bet = Some((start_price, signal.side, signal.size_usdc, entry_price, signal.fee_pct));
             traded_this_window = true;
         } else if let Some(ref poly) = poly {
             let order_t = Instant::now();
-            match poly.place_order(token_id, polymarket::Side::Buy, signal.size_usdc, signal.price, fee_rate_bps).await {
+            match poly.place_order(token_id, polymarket::Side::Buy, signal.size_usdc, entry_price, fee_rate_bps).await {
                 Ok(result) => {
                     let order_ms = order_t.elapsed().as_millis();
                     tracing::info!("Ordre placé: {} (status: {}) en {}ms",
                         result.order_id, result.status, order_ms);
                     if result.status == "matched" {
-                        pending_bet = Some((start_price, signal.side, signal.size_usdc, signal.price, signal.fee_pct));
+                        pending_bet = Some((start_price, signal.side, signal.size_usdc, entry_price, signal.fee_pct));
                     } else {
                         tracing::warn!("Ordre non matched (status: {})", result.status);
                     }
