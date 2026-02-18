@@ -68,11 +68,17 @@ struct StrategyToml {
     max_market_price: f64,
     #[serde(default)]
     dry_run: bool,
+    #[serde(default = "default_vol_lookback")]
+    vol_lookback_intervals: usize,
+    #[serde(default = "default_vol_pct")]
+    default_vol_pct: f64,
 }
 
 fn default_fee_rate_bps() -> u32 { 1000 }
 fn default_min_market_price() -> f64 { 0.15 }
 fn default_max_market_price() -> f64 { 0.85 }
+fn default_vol_lookback() -> usize { 20 }
+fn default_vol_pct() -> f64 { 0.12 }
 
 impl From<StrategyToml> for strategy::StrategyConfig {
     fn from(s: StrategyToml) -> Self {
@@ -108,6 +114,8 @@ async fn main() -> Result<()> {
     let config = load_config()?;
     let dry_run = config.strategy.dry_run;
     let poll_ms = config.chainlink.poll_interval_ms;
+    let vol_lookback = config.strategy.vol_lookback_intervals;
+    let default_vol = config.strategy.default_vol_pct;
     let strat_config = strategy::StrategyConfig::from(config.strategy);
     let feed: Address = config.chainlink.btc_usd_feed.parse().context("Invalid feed address")?;
 
@@ -165,6 +173,7 @@ async fn main() -> Result<()> {
     tracing::info!("Pre-warm done in {}ms", warmup_t.elapsed().as_millis());
 
     let mut session = strategy::Session::default();
+    let mut vol_tracker = strategy::VolTracker::new(vol_lookback, default_vol);
     let mut interval = time::interval(Duration::from_millis(poll_ms));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
@@ -217,12 +226,17 @@ async fn main() -> Result<()> {
                 );
             }
 
+            // Enregistrer le mouvement de l'intervalle précédent pour la vol dynamique
+            if current_window > 0 && start_price > 0.0 {
+                vol_tracker.record_move(start_price, price.price_usd);
+            }
+
             current_window = window;
             traded_this_window = false;
             start_price = price.price_usd;
             cached_market = None;
-            tracing::info!("--- Nouvel intervalle 5min (window={window}) | BTC: ${:.2} (fetch: {}ms) ---",
-                start_price, fetch_ms);
+            tracing::info!("--- Nouvel intervalle 5min (window={window}) | BTC: ${:.2} | vol: {:.3}% (fetch: {}ms) ---",
+                start_price, vol_tracker.current_vol(), fetch_ms);
 
             if session.pnl_usdc >= strat_config.session_profit_target_usdc
                 || session.pnl_usdc <= -strat_config.session_loss_limit_usdc
@@ -270,7 +284,7 @@ async fn main() -> Result<()> {
 
         let signal = match strategy::evaluate(
             start_price, price.price_usd, ex_price, market_up_price,
-            remaining, &session, &strat_config, fee_rate_bps,
+            remaining, &session, &strat_config, fee_rate_bps, vol_tracker.current_vol(),
         ) {
             Some(s) => s,
             None => continue,

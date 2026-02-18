@@ -1,4 +1,5 @@
 use crate::polymarket::Side;
+use std::collections::VecDeque;
 
 /// Configuration de la stratégie (chargée depuis config.toml).
 #[derive(Debug, Clone)]
@@ -44,6 +45,42 @@ impl Session {
     }
 }
 
+/// Suit la volatilité réalisée sur les derniers intervalles 5min.
+#[derive(Debug)]
+pub struct VolTracker {
+    recent_moves: VecDeque<f64>,
+    max_samples: usize,
+    default_vol: f64,
+}
+
+impl VolTracker {
+    pub fn new(max_samples: usize, default_vol: f64) -> Self {
+        Self { recent_moves: VecDeque::with_capacity(max_samples), max_samples, default_vol }
+    }
+
+    /// Enregistre le mouvement de prix d'un intervalle terminé (% signé).
+    pub fn record_move(&mut self, start_price: f64, end_price: f64) {
+        if start_price <= 0.0 { return; }
+        let pct = (end_price - start_price) / start_price * 100.0;
+        self.recent_moves.push_back(pct);
+        if self.recent_moves.len() > self.max_samples {
+            self.recent_moves.pop_front();
+        }
+    }
+
+    /// Volatilité estimée (std dev des mouvements récents).
+    /// Retourne default_vol si pas assez de données (< 3 samples).
+    pub fn current_vol(&self) -> f64 {
+        if self.recent_moves.len() < 3 {
+            return self.default_vol;
+        }
+        let n = self.recent_moves.len() as f64;
+        let mean = self.recent_moves.iter().sum::<f64>() / n;
+        let variance = self.recent_moves.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+        variance.sqrt().clamp(0.01, 1.0)
+    }
+}
+
 /// Évalue si on doit trader sur cet intervalle.
 /// `exchange_price` : prix WS exchanges (plus frais), fallback sur `chainlink_price`.
 pub fn evaluate(
@@ -55,6 +92,7 @@ pub fn evaluate(
     session: &Session,
     config: &StrategyConfig,
     fee_rate_bps: u32,
+    vol_5min_pct: f64,
 ) -> Option<Signal> {
     // 1. Session limits
     if session.pnl_usdc >= config.session_profit_target_usdc {
@@ -81,7 +119,7 @@ pub fn evaluate(
     // Préfère le prix exchange (100-200ms plus frais) si disponible
     let current_price = exchange_price.unwrap_or(chainlink_price);
     let price_change_pct = (current_price - start_price) / start_price * 100.0;
-    let true_up_prob = price_change_to_probability(price_change_pct, seconds_remaining);
+    let true_up_prob = price_change_to_probability(price_change_pct, seconds_remaining, vol_5min_pct);
     let true_down_prob = 1.0 - true_up_prob;
     let market_down_price = 1.0 - market_up_price;
 
@@ -130,9 +168,7 @@ pub fn dynamic_fee(price: f64, fee_rate_bps: u32) -> f64 {
 
 /// Probabilité UP time-aware basée sur un modèle de volatilité.
 /// Utilise la vol résiduelle pour pondérer la confiance selon le temps restant.
-fn price_change_to_probability(pct_change: f64, seconds_remaining: u64) -> f64 {
-    // Vol 5min BTC typique ~0.12%
-    let vol_5min_pct = 0.12;
+fn price_change_to_probability(pct_change: f64, seconds_remaining: u64, vol_5min_pct: f64) -> f64 {
     let remaining_vol = vol_5min_pct * ((seconds_remaining as f64) / 300.0).sqrt();
 
     if remaining_vol < 1e-9 {
@@ -187,37 +223,37 @@ mod tests {
 
     // --- price_change_to_probability ---
 
+    const DEFAULT_VOL: f64 = 0.12;
+
     #[test]
     fn prob_positive_move_low_time() {
-        // +0.05% avec 5s restantes → très confiant UP
-        let p = price_change_to_probability(0.05, 5);
+        let p = price_change_to_probability(0.05, 5, DEFAULT_VOL);
         assert!(p > 0.95, "got {p}");
     }
 
     #[test]
     fn prob_positive_move_high_time() {
-        // +0.05% avec 60s restantes → moins confiant
-        let p = price_change_to_probability(0.05, 60);
+        let p = price_change_to_probability(0.05, 60, DEFAULT_VOL);
         assert!(p > 0.5 && p < 0.95, "got {p}");
     }
 
     #[test]
     fn prob_flat() {
-        let p = price_change_to_probability(0.0, 30);
+        let p = price_change_to_probability(0.0, 30, DEFAULT_VOL);
         assert!((p - 0.5).abs() < 0.001, "got {p}");
     }
 
     #[test]
     fn prob_negative_move() {
-        let p = price_change_to_probability(-0.05, 10);
+        let p = price_change_to_probability(-0.05, 10, DEFAULT_VOL);
         assert!(p < 0.1, "got {p}");
     }
 
     #[test]
     fn prob_zero_time_locks_direction() {
-        assert!(price_change_to_probability(0.01, 0) == 1.0);
-        assert!(price_change_to_probability(-0.01, 0) == 0.0);
-        assert!(price_change_to_probability(0.0, 0) == 0.5);
+        assert!(price_change_to_probability(0.01, 0, DEFAULT_VOL) == 1.0);
+        assert!(price_change_to_probability(-0.01, 0, DEFAULT_VOL) == 0.0);
+        assert!(price_change_to_probability(0.0, 0, DEFAULT_VOL) == 0.5);
     }
 
     // --- half_kelly ---
@@ -247,7 +283,7 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // BTC +0.05% avec 10s restantes, marché à 50/50
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.50, 10, &session, &config, config.fee_rate_bps);
+        let signal = evaluate(100_000.0, 100_050.0, None, 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
         assert!(signal.is_some());
         let s = signal.unwrap();
         assert_eq!(s.side, Side::Buy);
@@ -259,7 +295,7 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // BTC -0.05% avec 10s restantes, marché à 50/50
-        let signal = evaluate(100_000.0, 99_950.0, None, 0.50, 10, &session, &config, config.fee_rate_bps);
+        let signal = evaluate(100_000.0, 99_950.0, None, 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
         assert!(signal.is_some());
         let s = signal.unwrap();
         assert_eq!(s.side, Side::Sell); // Sell = buy DOWN token
@@ -270,7 +306,7 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // 60s restantes > entry_seconds_before_end (30)
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.50, 60, &session, &config, config.fee_rate_bps);
+        let signal = evaluate(100_000.0, 100_050.0, None, 0.50, 60, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
         assert!(signal.is_none());
     }
 
@@ -279,7 +315,7 @@ mod tests {
         let config = test_config();
         let mut session = Session::default();
         session.pnl_usdc = 100.0; // target atteint
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.50, 10, &session, &config, config.fee_rate_bps);
+        let signal = evaluate(100_000.0, 100_050.0, None, 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
         assert!(signal.is_none());
     }
 
@@ -288,7 +324,7 @@ mod tests {
         let config = test_config();
         let mut session = Session::default();
         session.pnl_usdc = -50.0; // limit atteint
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.50, 10, &session, &config, config.fee_rate_bps);
+        let signal = evaluate(100_000.0, 100_050.0, None, 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
         assert!(signal.is_none());
     }
 
@@ -297,7 +333,7 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // Marché déjà ajusté à 0.99 → edge < 1% (min_edge_pct)
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.99, 10, &session, &config, config.fee_rate_bps);
+        let signal = evaluate(100_000.0, 100_050.0, None, 0.99, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
         assert!(signal.is_none());
     }
 
@@ -305,8 +341,8 @@ mod tests {
     fn evaluate_rejects_bad_market_price() {
         let config = test_config();
         let session = Session::default();
-        assert!(evaluate(100_000.0, 100_050.0, None, 1.5, 10, &session, &config, config.fee_rate_bps).is_none());
-        assert!(evaluate(100_000.0, 100_050.0, None, 0.0, 10, &session, &config, config.fee_rate_bps).is_none());
+        assert!(evaluate(100_000.0, 100_050.0, None, 1.5, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL).is_none());
+        assert!(evaluate(100_000.0, 100_050.0, None, 0.0, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL).is_none());
     }
 
     // --- dynamic_fee ---
@@ -336,7 +372,7 @@ mod tests {
         let session = Session::default();
         // BTC +0.0005% avec 10s restantes, marché à 50/50
         // Edge brut ~0.9%, fee ~0.625% → net edge ~0.28% < min_edge 1%
-        let signal = evaluate(100_000.0, 100_000.5, None, 0.50, 10, &session, &config, config.fee_rate_bps);
+        let signal = evaluate(100_000.0, 100_000.5, None, 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
         assert!(signal.is_none());
     }
 
@@ -347,7 +383,7 @@ mod tests {
         let config = test_config(); // min=0.15
         let session = Session::default();
         // Marché à 0.10 → en dessous de min_market_price
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.10, 10, &session, &config, config.fee_rate_bps);
+        let signal = evaluate(100_000.0, 100_050.0, None, 0.10, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
         assert!(signal.is_none());
     }
 
@@ -356,7 +392,7 @@ mod tests {
         let config = test_config(); // max=0.85
         let session = Session::default();
         // Marché à 0.90 → au dessus de max_market_price
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.90, 10, &session, &config, config.fee_rate_bps);
+        let signal = evaluate(100_000.0, 100_050.0, None, 0.90, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
         assert!(signal.is_none());
     }
 
@@ -365,7 +401,7 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // Marché à 0.70, dans la zone autorisée, +0.05% avec 10s restantes
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.70, 10, &session, &config, config.fee_rate_bps);
+        let signal = evaluate(100_000.0, 100_050.0, None, 0.70, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
         assert!(signal.is_some());
     }
 
@@ -376,7 +412,7 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // Chainlink flat, mais exchange montre +0.05% → doit générer un signal BUY UP
-        let signal = evaluate(100_000.0, 100_000.0, Some(100_050.0), 0.50, 10, &session, &config, config.fee_rate_bps);
+        let signal = evaluate(100_000.0, 100_000.0, Some(100_050.0), 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
         assert!(signal.is_some());
         assert_eq!(signal.unwrap().side, Side::Buy);
     }
@@ -386,8 +422,56 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // exchange_price = None → utilise chainlink_price (+0.05%)
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.50, 10, &session, &config, config.fee_rate_bps);
+        let signal = evaluate(100_000.0, 100_050.0, None, 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
         assert!(signal.is_some());
         assert_eq!(signal.unwrap().side, Side::Buy);
+    }
+
+    // --- VolTracker ---
+
+    #[test]
+    fn vol_tracker_with_no_data_returns_default() {
+        let vt = VolTracker::new(20, 0.12);
+        assert!((vt.current_vol() - 0.12).abs() < 0.001);
+    }
+
+    #[test]
+    fn vol_tracker_with_few_samples_returns_default() {
+        let mut vt = VolTracker::new(20, 0.12);
+        vt.record_move(100_000.0, 100_100.0);
+        vt.record_move(100_000.0, 99_900.0);
+        // Seulement 2 samples < 3 → default
+        assert!((vt.current_vol() - 0.12).abs() < 0.001);
+    }
+
+    #[test]
+    fn vol_tracker_adapts() {
+        let mut vt = VolTracker::new(5, 0.12);
+        // Mouvements de ~0.2% → vol devrait être ~0.2%
+        for _ in 0..5 {
+            vt.record_move(100_000.0, 100_200.0);
+        }
+        // Tous les mêmes → std dev = 0, clamped à 0.01
+        // Il faut de la variance — alternons +0.2% et -0.2%
+        let mut vt2 = VolTracker::new(10, 0.12);
+        for i in 0..10 {
+            if i % 2 == 0 {
+                vt2.record_move(100_000.0, 100_200.0);
+            } else {
+                vt2.record_move(100_000.0, 99_800.0);
+            }
+        }
+        let vol = vt2.current_vol();
+        assert!(vol > 0.15, "got {vol}"); // std dev de ±0.2 ≈ 0.2
+    }
+
+    #[test]
+    fn vol_tracker_evicts_old_samples() {
+        let mut vt = VolTracker::new(3, 0.12);
+        vt.record_move(100_000.0, 100_100.0); // +0.1%
+        vt.record_move(100_000.0, 99_900.0);  // -0.1%
+        vt.record_move(100_000.0, 100_050.0); // +0.05%
+        vt.record_move(100_000.0, 99_950.0);  // -0.05% (évince le premier)
+        assert_eq!(vt.recent_moves.len(), 3);
     }
 }
