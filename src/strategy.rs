@@ -19,6 +19,9 @@ pub struct StrategyConfig {
 pub struct Signal {
     pub side: Side,
     pub edge_pct: f64,
+    pub edge_brut_pct: f64,
+    pub fee_pct: f64,
+    pub implied_p_up: f64,
     pub size_usdc: f64,
     pub price: f64,
 }
@@ -93,6 +96,7 @@ pub fn evaluate(
     config: &StrategyConfig,
     fee_rate_bps: u32,
     vol_5min_pct: f64,
+    spread: f64,
 ) -> Option<Signal> {
     // 1. Session limits
     if session.pnl_usdc >= config.session_profit_target_usdc {
@@ -151,7 +155,8 @@ pub fn evaluate(
 
     let edge_pct = edge * 100.0;
     let fee = dynamic_fee(market_price, fee_rate_bps);
-    let net_edge_pct = edge_pct - (fee * 100.0);
+    let spread_cost = spread / 2.0; // taker pays half the spread
+    let net_edge_pct = edge_pct - (fee * 100.0) - (spread_cost * 100.0);
 
     if net_edge_pct < config.min_edge_pct {
         return None;
@@ -170,7 +175,15 @@ pub fn evaluate(
         if exchange_price.is_some() { "WS" } else { "CL" },
     );
 
-    Some(Signal { side, edge_pct: net_edge_pct, size_usdc: size, price: market_price })
+    Some(Signal {
+        side,
+        edge_pct: net_edge_pct,
+        edge_brut_pct: edge_pct,
+        fee_pct: fee * 100.0,
+        implied_p_up: true_up_prob,
+        size_usdc: size,
+        price: market_price,
+    })
 }
 
 /// Calcule les frais dynamiques Polymarket.
@@ -297,7 +310,7 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // BTC +0.05% avec 10s restantes, marché à 50/50
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
+        let signal = evaluate(100_000.0, 100_050.0, None, 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0);
         assert!(signal.is_some());
         let s = signal.unwrap();
         assert_eq!(s.side, Side::Buy);
@@ -309,7 +322,7 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // BTC -0.05% avec 10s restantes, marché à 50/50
-        let signal = evaluate(100_000.0, 99_950.0, None, 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
+        let signal = evaluate(100_000.0, 99_950.0, None, 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0);
         assert!(signal.is_some());
         let s = signal.unwrap();
         assert_eq!(s.side, Side::Sell); // Sell = buy DOWN token
@@ -320,7 +333,7 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // 60s restantes > entry_seconds_before_end (30)
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.50, 60, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
+        let signal = evaluate(100_000.0, 100_050.0, None, 0.50, 60, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0);
         assert!(signal.is_none());
     }
 
@@ -329,7 +342,7 @@ mod tests {
         let config = test_config();
         let mut session = Session::default();
         session.pnl_usdc = 100.0; // target atteint
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
+        let signal = evaluate(100_000.0, 100_050.0, None, 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0);
         assert!(signal.is_none());
     }
 
@@ -338,7 +351,7 @@ mod tests {
         let config = test_config();
         let mut session = Session::default();
         session.pnl_usdc = -50.0; // limit atteint
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
+        let signal = evaluate(100_000.0, 100_050.0, None, 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0);
         assert!(signal.is_none());
     }
 
@@ -347,7 +360,7 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // Marché déjà ajusté à 0.99 → edge < 1% (min_edge_pct)
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.99, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
+        let signal = evaluate(100_000.0, 100_050.0, None, 0.99, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0);
         assert!(signal.is_none());
     }
 
@@ -355,8 +368,8 @@ mod tests {
     fn evaluate_rejects_bad_market_price() {
         let config = test_config();
         let session = Session::default();
-        assert!(evaluate(100_000.0, 100_050.0, None, 1.5, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL).is_none());
-        assert!(evaluate(100_000.0, 100_050.0, None, 0.0, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL).is_none());
+        assert!(evaluate(100_000.0, 100_050.0, None, 1.5, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0).is_none());
+        assert!(evaluate(100_000.0, 100_050.0, None, 0.0, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0).is_none());
     }
 
     // --- dynamic_fee ---
@@ -386,7 +399,7 @@ mod tests {
         let session = Session::default();
         // BTC +0.0005% avec 10s restantes, marché à 50/50
         // Edge brut ~0.9%, fee ~0.625% → net edge ~0.28% < min_edge 1%
-        let signal = evaluate(100_000.0, 100_000.5, None, 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
+        let signal = evaluate(100_000.0, 100_000.5, None, 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0);
         assert!(signal.is_none());
     }
 
@@ -397,7 +410,7 @@ mod tests {
         let config = test_config(); // min=0.15
         let session = Session::default();
         // Marché à 0.10 → en dessous de min_market_price
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.10, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
+        let signal = evaluate(100_000.0, 100_050.0, None, 0.10, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0);
         assert!(signal.is_none());
     }
 
@@ -406,7 +419,7 @@ mod tests {
         let config = test_config(); // max=0.85
         let session = Session::default();
         // Marché à 0.90 → au dessus de max_market_price
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.90, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
+        let signal = evaluate(100_000.0, 100_050.0, None, 0.90, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0);
         assert!(signal.is_none());
     }
 
@@ -415,7 +428,7 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // Marché à 0.70, dans la zone autorisée, +0.05% avec 10s restantes
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.70, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
+        let signal = evaluate(100_000.0, 100_050.0, None, 0.70, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0);
         assert!(signal.is_some());
     }
 
@@ -426,7 +439,7 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // Les deux UP, mais exchange montre un mouvement plus large → signal basé sur exchange
-        let signal = evaluate(100_000.0, 100_010.0, Some(100_050.0), 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
+        let signal = evaluate(100_000.0, 100_010.0, Some(100_050.0), 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0);
         assert!(signal.is_some());
         assert_eq!(signal.unwrap().side, Side::Buy);
     }
@@ -436,7 +449,7 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // exchange_price = None → utilise chainlink_price (+0.05%)
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
+        let signal = evaluate(100_000.0, 100_050.0, None, 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0);
         assert!(signal.is_some());
         assert_eq!(signal.unwrap().side, Side::Buy);
     }
@@ -498,7 +511,7 @@ mod tests {
         // Chainlink dit DOWN (-0.05%), exchanges dit UP (+0.05%) → divergence → None
         let signal = evaluate(
             100_000.0, 99_950.0, Some(100_050.0),
-            0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL,
+            0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0,
         );
         assert!(signal.is_none());
     }
@@ -510,7 +523,7 @@ mod tests {
         // Les deux disent UP → pas de divergence
         let signal = evaluate(
             100_000.0, 100_030.0, Some(100_050.0),
-            0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL,
+            0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0,
         );
         assert!(signal.is_some());
     }
@@ -522,8 +535,30 @@ mod tests {
         // Chainlink flat (== start), exchange UP → tolérance, pas de divergence
         let signal = evaluate(
             100_000.0, 100_000.0, Some(100_050.0),
-            0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL,
+            0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0,
         );
         assert!(signal.is_some());
+    }
+
+    // --- spread integration ---
+
+    #[test]
+    fn evaluate_rejects_when_spread_kills_edge() {
+        let config = test_config();
+        let session = Session::default();
+        // BTC +0.005% with 10s remaining, market at 0.55
+        // Edge brut ~4%, fee ~0.6%, net ~3.4% → passes with 0 spread
+        let with_no_spread = evaluate(
+            100_000.0, 100_005.0, None, 0.55, 10,
+            &session, &config, 1000, DEFAULT_VOL, 0.0,
+        );
+        assert!(with_no_spread.is_some(), "should pass with 0 spread");
+
+        // With spread=0.06 → spread_cost=3%, net edge ~0.4% < min_edge 1% → rejected
+        let with_spread = evaluate(
+            100_000.0, 100_005.0, None, 0.55, 10,
+            &session, &config, 1000, DEFAULT_VOL, 0.06,
+        );
+        assert!(with_spread.is_none(), "spread should kill the edge");
     }
 }

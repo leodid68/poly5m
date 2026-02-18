@@ -340,10 +340,19 @@ async fn main() -> Result<()> {
 
         last_mid = market_up_price;
 
+        // Fetch book for spread (before evaluate)
+        let book = if let Some(ref poly) = poly {
+            let token = cached_market.as_ref().map(|m| m.token_id_yes.as_str()).unwrap_or("0");
+            poly.get_book(token).await.unwrap_or_default()
+        } else {
+            polymarket::BookData::default()
+        };
+
         // evaluate() : CL price for divergence check, WS price for probability model
         let signal = match strategy::evaluate(
             start_price, cl_price.unwrap_or(current_btc), ws_price, market_up_price,
             remaining, &session, &strat_config, fee_rate_bps, vol_tracker.current_vol(),
+            book.spread,
         ) {
             Some(s) => s,
             None => {
@@ -364,13 +373,6 @@ async fn main() -> Result<()> {
             Some(m) if signal.side == polymarket::Side::Buy => (&m.token_id_yes, "YES"),
             Some(m) => (&m.token_id_no, "NO"),
             None => (&dummy_token, "YES"),
-        };
-
-        // Fetch order book data
-        let book = if let Some(ref poly) = poly {
-            poly.get_book(token_id).await.unwrap_or_default()
-        } else {
-            polymarket::BookData::default()
         };
 
         let side_label = if signal.side == polymarket::Side::Buy { "BUY_UP" } else { "BUY_DOWN" };
