@@ -303,6 +303,13 @@ async fn main() -> Result<()> {
         if traded_this_window { continue; }
         if remaining > strat_config.entry_seconds_before_end { continue; }
 
+        // Fetch Chainlink independently for divergence check (even if WS is primary)
+        let cl_price = match fetch_racing(&providers, feed).await {
+            Ok(p) if now <= p.updated_at + 3700 => Some(p.price_usd),
+            Ok(_) => None,
+            Err(_) => None,
+        };
+
         // Fenêtre d'entrée : fetch marché (cache) + midpoint + fee rate
         let (market, market_up_price, fee_rate_bps) = if let Some(ref poly) = poly {
             if cached_market.is_none() {
@@ -333,9 +340,9 @@ async fn main() -> Result<()> {
 
         last_mid = market_up_price;
 
-        // evaluate() : current_btc comme prix principal, pas de split CL/WS
+        // evaluate() : CL price for divergence check, WS price for probability model
         let signal = match strategy::evaluate(
-            start_price, current_btc, None, market_up_price,
+            start_price, cl_price.unwrap_or(current_btc), ws_price, market_up_price,
             remaining, &session, &strat_config, fee_rate_bps, vol_tracker.current_vol(),
         ) {
             Some(s) => s,
