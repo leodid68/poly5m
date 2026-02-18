@@ -212,7 +212,7 @@ async fn main() -> Result<()> {
     let mut start_price = 0.0f64;
     let mut traded_this_window = false;
     let mut cached_market: Option<polymarket::Market> = None;
-    let mut pending_bet: Option<(f64, polymarket::Side, f64, f64)> = None; // (start_price, side, size, price)
+    let mut pending_bet: Option<(f64, polymarket::Side, f64, f64, f64)> = None; // (start_price, side, size, price, fee_pct)
     let mut last_mid = 0.0f64;
     let mut skip_reason = String::from("startup");
     let mut macro_ctx = macro_data::MacroData::default();
@@ -257,16 +257,12 @@ async fn main() -> Result<()> {
                 }
             }
 
-            if let Some((bet_start, bet_side, bet_size, bet_price)) = pending_bet.take() {
+            if let Some((bet_start, bet_side, bet_size, bet_price, bet_fee_pct)) = pending_bet.take() {
                 // Polymarket rule: end_price >= start_price → UP wins (equality = UP)
                 let went_up = resolve_up(bet_start, current_btc);
                 let won = (went_up && bet_side == polymarket::Side::Buy)
                     || (!went_up && bet_side != polymarket::Side::Buy);
-                let pnl = if won {
-                    bet_size * (1.0 / bet_price - 1.0)
-                } else {
-                    -bet_size
-                };
+                let pnl = compute_pnl(won, bet_size, bet_price, bet_fee_pct);
                 session.record_trade(pnl);
                 let result_str = if won { "WIN" } else { "LOSS" };
                 tracing::info!(
@@ -389,7 +385,7 @@ async fn main() -> Result<()> {
         }
 
         if dry_run {
-            pending_bet = Some((start_price, signal.side, signal.size_usdc, signal.price));
+            pending_bet = Some((start_price, signal.side, signal.size_usdc, signal.price, signal.fee_pct));
             traded_this_window = true;
         } else if let Some(ref poly) = poly {
             let order_t = Instant::now();
@@ -399,7 +395,7 @@ async fn main() -> Result<()> {
                     tracing::info!("Ordre placé: {} (status: {}) en {}ms",
                         result.order_id, result.status, order_ms);
                     if result.status == "matched" {
-                        pending_bet = Some((start_price, signal.side, signal.size_usdc, signal.price));
+                        pending_bet = Some((start_price, signal.side, signal.size_usdc, signal.price, signal.fee_pct));
                     } else {
                         tracing::warn!("Ordre non matched (status: {})", result.status);
                     }
@@ -425,6 +421,17 @@ async fn main() -> Result<()> {
 /// Polymarket rule: end_price >= start_price → UP wins (equality = UP).
 fn resolve_up(start_price: f64, end_price: f64) -> bool {
     end_price >= start_price
+}
+
+/// Compute PnL for a resolved bet, subtracting the entry fee on wins.
+/// On loss, the fee is already included in the -size (total loss).
+fn compute_pnl(won: bool, size: f64, price: f64, fee_pct: f64) -> f64 {
+    let fee_cost = size * fee_pct / 100.0;
+    if won {
+        size * (1.0 / price - 1.0) - fee_cost
+    } else {
+        -size
+    }
 }
 
 /// Fetch prix Chainlink en RACING parallèle — prend la 1ère réponse.
@@ -461,5 +468,24 @@ mod tests {
     #[test]
     fn resolve_up_price_lower() {
         assert!(!resolve_up(100_000.0, 99_999.0));
+    }
+
+    #[test]
+    fn pnl_win_subtracts_fee() {
+        let size = 2.0;
+        let price = 0.65;
+        let fee_pct = 0.52;
+        let pnl = compute_pnl(true, size, price, fee_pct);
+        let expected = size * (1.0 / price - 1.0) - size * 0.0052;
+        assert!((pnl - expected).abs() < 1e-10, "pnl={pnl} expected={expected}");
+    }
+
+    #[test]
+    fn pnl_loss_no_fee_deduction() {
+        let size = 2.0;
+        let price = 0.65;
+        let fee_pct = 0.52;
+        let pnl = compute_pnl(false, size, price, fee_pct);
+        assert!((pnl - (-size)).abs() < 1e-10, "loss pnl should be -size, got {pnl}");
     }
 }
