@@ -262,8 +262,14 @@ async fn main() -> Result<()> {
             (None, 0.50, strat_config.fee_rate_bps)
         };
 
+        // Prix exchange WS (plus frais que Chainlink) si disponible et non-stale
+        let ex_price = exchange_feed.as_ref()
+            .map(|ef| ef.latest())
+            .filter(|agg| agg.num_sources > 0)
+            .map(|agg| agg.median_price);
+
         let signal = match strategy::evaluate(
-            start_price, price.price_usd, market_up_price,
+            start_price, price.price_usd, ex_price, market_up_price,
             remaining, &session, &strat_config, fee_rate_bps,
         ) {
             Some(s) => s,
