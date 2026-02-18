@@ -86,6 +86,10 @@ struct StrategyToml {
     vol_lookback_intervals: usize,
     #[serde(default = "default_vol_pct")]
     default_vol_pct: f64,
+    #[serde(default = "default_order_type")]
+    order_type: String,
+    #[serde(default = "default_maker_timeout")]
+    maker_timeout_s: u64,
 }
 
 fn default_fee_rate_bps() -> u32 { 1000 }
@@ -93,6 +97,8 @@ fn default_min_market_price() -> f64 { 0.15 }
 fn default_max_market_price() -> f64 { 0.85 }
 fn default_vol_lookback() -> usize { 20 }
 fn default_vol_pct() -> f64 { 0.12 }
+fn default_order_type() -> String { "FOK".into() }
+fn default_maker_timeout() -> u64 { 5 }
 
 impl From<StrategyToml> for strategy::StrategyConfig {
     fn from(s: StrategyToml) -> Self {
@@ -131,6 +137,8 @@ async fn main() -> Result<()> {
     let poll_ms_ws = config.chainlink.poll_interval_ms_with_ws;
     let vol_lookback = config.strategy.vol_lookback_intervals;
     let default_vol = config.strategy.default_vol_pct;
+    let order_type = config.strategy.order_type.clone();
+    let maker_timeout_s = config.strategy.maker_timeout_s;
     let strat_config = strategy::StrategyConfig::from(config.strategy);
     let feed: Address = config.chainlink.btc_usd_feed.parse().context("Invalid feed address")?;
 
@@ -177,9 +185,9 @@ async fn main() -> Result<()> {
     tracing::info!("poly5m — Bot d'arbitrage Polymarket 5min BTC{}{}",
         if dry_run { " [DRY-RUN]" } else { "" },
         if exchange_feed.is_some() { " [WS]" } else { "" });
-    tracing::info!("Config: max_bet=${} min_edge={}% entry={}s avant fin | {} RPCs | poll={}ms",
+    tracing::info!("Config: max_bet=${} min_edge={}% entry={}s | {} RPCs | poll={}ms | order_type={}",
         strat_config.max_bet_usdc, strat_config.min_edge_pct,
-        strat_config.entry_seconds_before_end, providers.len(), poll_ms);
+        strat_config.entry_seconds_before_end, providers.len(), poll_ms, order_type);
 
     // --- Pre-warm : établit TCP+TLS vers tous les endpoints ---
     tracing::info!("Pre-warming connections...");
@@ -437,29 +445,56 @@ async fn main() -> Result<()> {
             traded_this_window = true;
         } else if let Some(ref poly) = poly {
             let order_t = Instant::now();
-            match poly.place_order(token_id, polymarket::Side::Buy, signal.size_usdc, entry_price, fee_rate_bps).await {
-                Ok(result) => {
-                    let order_ms = order_t.elapsed().as_millis();
-                    tracing::info!("Ordre placé: {} (status: {}) en {}ms",
-                        result.order_id, result.status, order_ms);
-                    if result.status == "matched" {
-                        pending_bet = Some(PendingBet {
-                            start_price,
-                            side: signal.side,
-                            size_usdc: signal.size_usdc,
-                            entry_price,
-                            fee_pct: signal.fee_pct,
-                        });
-                    } else {
-                        tracing::warn!("Ordre non matched (status: {})", result.status);
+            let order_result = if order_type == "GTC" {
+                // Maker order: place GTC, wait for fill, cancel if timeout
+                match poly.place_limit_order(token_id, polymarket::Side::Buy, signal.size_usdc, entry_price, fee_rate_bps).await {
+                    Ok(result) => {
+                        let order_ms = order_t.elapsed().as_millis();
+                        tracing::info!("[MAKER] Ordre GTC placé: {} en {}ms", result.order_id, order_ms);
+                        if result.status == "matched" {
+                            // Immediately filled (crossed the book)
+                            Some(result)
+                        } else {
+                            // Wait for fill
+                            tokio::time::sleep(Duration::from_secs(maker_timeout_s)).await;
+                            // TODO: Check order status via API — for now, cancel after timeout
+                            tracing::info!("[MAKER] Timeout {}s — cancelling {}", maker_timeout_s, result.order_id);
+                            if let Err(e) = poly.cancel_order(&result.order_id).await {
+                                tracing::warn!("[MAKER] Cancel failed: {e:#}");
+                            }
+                            None // Order not filled
+                        }
                     }
-                    traded_this_window = true;
+                    Err(e) => {
+                        tracing::error!("Erreur ordre GTC: {e:#} ({}ms)", order_t.elapsed().as_millis());
+                        None
+                    }
                 }
-                Err(e) => {
-                    tracing::error!("Erreur ordre: {e:#} ({}ms)", order_t.elapsed().as_millis());
-                    traded_this_window = true;
+            } else {
+                // Taker order: FOK (existing behavior)
+                match poly.place_order(token_id, polymarket::Side::Buy, signal.size_usdc, entry_price, fee_rate_bps).await {
+                    Ok(result) => {
+                        let order_ms = order_t.elapsed().as_millis();
+                        tracing::info!("Ordre FOK: {} (status: {}) en {}ms", result.order_id, result.status, order_ms);
+                        if result.status == "matched" { Some(result) } else { None }
+                    }
+                    Err(e) => {
+                        tracing::error!("Erreur ordre FOK: {e:#} ({}ms)", order_t.elapsed().as_millis());
+                        None
+                    }
                 }
+            };
+
+            if order_result.is_some() {
+                pending_bet = Some(PendingBet {
+                    start_price,
+                    side: signal.side,
+                    size_usdc: signal.size_usdc,
+                    entry_price,
+                    fee_pct: if order_type == "GTC" { 0.0 } else { signal.fee_pct },
+                });
             }
+            traded_this_window = true;
         }
     }
 

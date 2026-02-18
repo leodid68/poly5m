@@ -271,6 +271,54 @@ impl PolymarketClient {
         price: f64,
         fee_rate_bps: u32,
     ) -> Result<OrderResult> {
+        self.build_and_send_order(token_id, side, size_usdc, price, fee_rate_bps, "FOK").await
+    }
+
+    /// Place un ordre GTC (Good-Til-Cancelled) — maker order, 0 fees.
+    pub async fn place_limit_order(
+        &self,
+        token_id: &str,
+        side: Side,
+        size_usdc: f64,
+        price: f64,
+        fee_rate_bps: u32,
+    ) -> Result<OrderResult> {
+        self.build_and_send_order(token_id, side, size_usdc, price, fee_rate_bps, "GTC").await
+    }
+
+    /// Cancel an open order.
+    pub async fn cancel_order(&self, order_id: &str) -> Result<()> {
+        let body = serde_json::json!({ "orderID": order_id });
+        let body_str = body.to_string();
+        let path = "/order";
+        let headers = self.sign_hmac("DELETE", path, &body_str)?;
+
+        let mut req = self.http.delete(format!("{CLOB_BASE}{path}"))
+            .header("Content-Type", "application/json")
+            .body(body_str);
+        for (k, v) in &headers {
+            req = req.header(k, v);
+        }
+
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Cancel API error ({status}): {body}");
+        }
+        Ok(())
+    }
+
+    /// Place an order with the given type (FOK or GTC).
+    async fn build_and_send_order(
+        &self,
+        token_id: &str,
+        side: Side,
+        size_usdc: f64,
+        price: f64,
+        fee_rate_bps: u32,
+        order_type: &str,
+    ) -> Result<OrderResult> {
         let side_u8: u8 = if side == Side::Buy { 0 } else { 1 };
 
         // Amounts en unités raw (6 décimales USDC), .round() évite les erreurs f64
@@ -306,7 +354,7 @@ impl PolymarketClient {
 
         let body = serde_json::json!({
             "owner": format!("{}", self.wallet_address),
-            "orderType": "FOK",
+            "orderType": order_type,
             "order": {
                 "salt": order.salt.to_string(),
                 "maker": format!("{}", order.maker),
