@@ -88,6 +88,11 @@ struct MidpointResponse {
 }
 
 #[derive(Deserialize)]
+struct FeeRateResponse {
+    base_fee: u32,
+}
+
+#[derive(Deserialize)]
 struct OrderResponse {
     #[serde(rename = "orderID")]
     order_id: String,
@@ -170,6 +175,21 @@ impl PolymarketClient {
         }
         let data: MidpointResponse = resp.json().await?;
         data.mid.parse::<f64>().context("Invalid midpoint value")
+    }
+
+    /// Récupère le fee_rate_bps pour un token (endpoint public).
+    pub async fn get_fee_rate(&self, token_id: &str) -> Result<u32> {
+        let resp = self.http
+            .get(format!("{CLOB_BASE}/fee-rate"))
+            .query(&[("token_id", token_id)])
+            .send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Fee-rate API error ({status}): {body}");
+        }
+        let data: FeeRateResponse = resp.json().await?;
+        Ok(data.base_fee)
     }
 
     /// Place un ordre FOK (Fill-Or-Kill).

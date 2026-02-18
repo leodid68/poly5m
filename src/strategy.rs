@@ -50,6 +50,7 @@ pub fn evaluate(
     seconds_remaining: u64,
     session: &Session,
     config: &StrategyConfig,
+    fee_rate_bps: u32,
 ) -> Option<Signal> {
     // 1. Session limits
     if session.pnl_usdc >= config.session_profit_target_usdc {
@@ -88,7 +89,7 @@ pub fn evaluate(
     };
 
     let edge_pct = edge * 100.0;
-    let fee = dynamic_fee(market_price, config.fee_rate_bps);
+    let fee = dynamic_fee(market_price, fee_rate_bps);
     let net_edge_pct = edge_pct - (fee * 100.0);
 
     if net_edge_pct < config.min_edge_pct {
@@ -234,7 +235,7 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // BTC +0.05% avec 10s restantes, marché à 50/50
-        let signal = evaluate(100_000.0, 100_050.0, 0.50, 10, &session, &config);
+        let signal = evaluate(100_000.0, 100_050.0, 0.50, 10, &session, &config, config.fee_rate_bps);
         assert!(signal.is_some());
         let s = signal.unwrap();
         assert_eq!(s.side, Side::Buy);
@@ -246,7 +247,7 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // BTC -0.05% avec 10s restantes, marché à 50/50
-        let signal = evaluate(100_000.0, 99_950.0, 0.50, 10, &session, &config);
+        let signal = evaluate(100_000.0, 99_950.0, 0.50, 10, &session, &config, config.fee_rate_bps);
         assert!(signal.is_some());
         let s = signal.unwrap();
         assert_eq!(s.side, Side::Sell); // Sell = buy DOWN token
@@ -257,7 +258,7 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // 60s restantes > entry_seconds_before_end (30)
-        let signal = evaluate(100_000.0, 100_050.0, 0.50, 60, &session, &config);
+        let signal = evaluate(100_000.0, 100_050.0, 0.50, 60, &session, &config, config.fee_rate_bps);
         assert!(signal.is_none());
     }
 
@@ -266,7 +267,7 @@ mod tests {
         let config = test_config();
         let mut session = Session::default();
         session.pnl_usdc = 100.0; // target atteint
-        let signal = evaluate(100_000.0, 100_050.0, 0.50, 10, &session, &config);
+        let signal = evaluate(100_000.0, 100_050.0, 0.50, 10, &session, &config, config.fee_rate_bps);
         assert!(signal.is_none());
     }
 
@@ -275,7 +276,7 @@ mod tests {
         let config = test_config();
         let mut session = Session::default();
         session.pnl_usdc = -50.0; // limit atteint
-        let signal = evaluate(100_000.0, 100_050.0, 0.50, 10, &session, &config);
+        let signal = evaluate(100_000.0, 100_050.0, 0.50, 10, &session, &config, config.fee_rate_bps);
         assert!(signal.is_none());
     }
 
@@ -284,7 +285,7 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // Marché déjà ajusté à 0.99 → edge < 1% (min_edge_pct)
-        let signal = evaluate(100_000.0, 100_050.0, 0.99, 10, &session, &config);
+        let signal = evaluate(100_000.0, 100_050.0, 0.99, 10, &session, &config, config.fee_rate_bps);
         assert!(signal.is_none());
     }
 
@@ -292,8 +293,8 @@ mod tests {
     fn evaluate_rejects_bad_market_price() {
         let config = test_config();
         let session = Session::default();
-        assert!(evaluate(100_000.0, 100_050.0, 1.5, 10, &session, &config).is_none());
-        assert!(evaluate(100_000.0, 100_050.0, 0.0, 10, &session, &config).is_none());
+        assert!(evaluate(100_000.0, 100_050.0, 1.5, 10, &session, &config, config.fee_rate_bps).is_none());
+        assert!(evaluate(100_000.0, 100_050.0, 0.0, 10, &session, &config, config.fee_rate_bps).is_none());
     }
 
     // --- dynamic_fee ---
@@ -323,7 +324,7 @@ mod tests {
         let session = Session::default();
         // BTC +0.0005% avec 10s restantes, marché à 50/50
         // Edge brut ~0.9%, fee ~0.625% → net edge ~0.28% < min_edge 1%
-        let signal = evaluate(100_000.0, 100_000.5, 0.50, 10, &session, &config);
+        let signal = evaluate(100_000.0, 100_000.5, 0.50, 10, &session, &config, config.fee_rate_bps);
         assert!(signal.is_none());
     }
 }

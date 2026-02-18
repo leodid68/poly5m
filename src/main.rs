@@ -195,8 +195,8 @@ async fn main() -> Result<()> {
         if traded_this_window { continue; }
         if remaining > strat_config.entry_seconds_before_end { continue; }
 
-        // Fenêtre d'entrée : fetch marché (cache) + midpoint
-        let (market, market_up_price) = if let Some(ref poly) = poly {
+        // Fenêtre d'entrée : fetch marché (cache) + midpoint + fee rate
+        let (market, market_up_price, fee_rate_bps) = if let Some(ref poly) = poly {
             if cached_market.is_none() {
                 match poly.find_5min_btc_market(current_window).await {
                     Ok(m) => cached_market = Some(m),
@@ -214,14 +214,16 @@ async fn main() -> Result<()> {
                     continue;
                 }
             };
-            (Some(market.clone()), mid)
+            let fee = poly.get_fee_rate(&market.token_id_yes).await
+                .unwrap_or(strat_config.fee_rate_bps);
+            (Some(market.clone()), mid, fee)
         } else {
-            (None, 0.50)
+            (None, 0.50, strat_config.fee_rate_bps)
         };
 
         let signal = match strategy::evaluate(
             start_price, price.price_usd, market_up_price,
-            remaining, &session, &strat_config,
+            remaining, &session, &strat_config, fee_rate_bps,
         ) {
             Some(s) => s,
             None => continue,
