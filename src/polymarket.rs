@@ -89,6 +89,7 @@ struct MidpointResponse {
 
 #[derive(Deserialize)]
 struct FeeRateResponse {
+    #[serde(alias = "fee_rate_bps")]
     base_fee: u32,
 }
 
@@ -398,6 +399,13 @@ mod tests {
         let json = r#"{"base_fee": 0}"#;
         let resp: FeeRateResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.base_fee, 0);
+    }
+
+    #[test]
+    fn parse_fee_rate_response_alt_field() {
+        let json = r#"{"fee_rate_bps": 1000}"#;
+        let resp: FeeRateResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.base_fee, 1000);
     }
 
     #[test]

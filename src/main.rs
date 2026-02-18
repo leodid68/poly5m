@@ -340,6 +340,11 @@ async fn main() -> Result<()> {
 
         last_mid = market_up_price;
 
+        tracing::debug!(
+            "Fee check: API bps={} | calc={:.4}% | mid={:.4}",
+            fee_rate_bps, strategy::dynamic_fee(market_up_price, fee_rate_bps) * 100.0, market_up_price
+        );
+
         // Fetch book for spread (before evaluate) — always YES token
         let spread_book = if let Some(ref poly) = poly {
             let token = cached_market.as_ref().map(|m| m.token_id_yes.as_str()).unwrap_or("0");
