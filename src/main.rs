@@ -147,7 +147,7 @@ async fn main() -> Result<()> {
         };
         let fetch_ms = fetch_t.elapsed().as_millis();
 
-        if now > price.updated_at + 3700 {
+        if now > price.updated_at + 300 {
             tracing::warn!("Chainlink stale: updated {}s ago", now - price.updated_at);
             continue;
         }
@@ -241,6 +241,7 @@ async fn main() -> Result<()> {
             traded_this_window = true;
         } else if let Some(ref poly) = poly {
             let order_t = Instant::now();
+            // Toujours Side::Buy : on achète le token UP ou DOWN, jamais de vente
             match poly.place_order(token_id, polymarket::Side::Buy, signal.size_usdc, signal.price).await {
                 Ok(result) => {
                     let order_ms = order_t.elapsed().as_millis();
