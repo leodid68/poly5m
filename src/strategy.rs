@@ -115,7 +115,17 @@ pub fn evaluate(
         return None;
     }
 
-    // 4. Direction et probabilité estimée (time-aware)
+    // 4. Cohérence Chainlink / exchanges — skip si divergence directionnelle
+    if let Some(ex_price) = exchange_price {
+        let chainlink_up = chainlink_price > start_price;
+        let exchange_up = ex_price > start_price;
+        if chainlink_up != exchange_up {
+            tracing::debug!("Skip: divergence CL/WS (CL={chainlink_price:.2}, WS={ex_price:.2}, start={start_price:.2})");
+            return None;
+        }
+    }
+
+    // 5. Direction et probabilité estimée (time-aware)
     // Préfère le prix exchange (100-200ms plus frais) si disponible
     let current_price = exchange_price.unwrap_or(chainlink_price);
     let price_change_pct = (current_price - start_price) / start_price * 100.0;
@@ -123,7 +133,7 @@ pub fn evaluate(
     let true_down_prob = 1.0 - true_up_prob;
     let market_down_price = 1.0 - market_up_price;
 
-    // 5. Edge — edge_up = -edge_down toujours, on check juste le signe
+    // 6. Edge — edge_up = -edge_down toujours, on check juste le signe
     let edge_up = true_up_prob - market_up_price;
     let edge_down = true_down_prob - market_down_price;
 
@@ -143,7 +153,7 @@ pub fn evaluate(
         return None;
     }
 
-    // 6. Half-Kelly sizing (max_bet sert de cap, pas de bankroll)
+    // 7. Half-Kelly sizing (max_bet sert de cap, pas de bankroll)
     let size = half_kelly(true_prob, market_price, config.max_bet_usdc);
     if size < 0.01 {
         return None;
@@ -411,8 +421,8 @@ mod tests {
     fn evaluate_uses_exchange_price_when_provided() {
         let config = test_config();
         let session = Session::default();
-        // Chainlink flat, mais exchange montre +0.05% → doit générer un signal BUY UP
-        let signal = evaluate(100_000.0, 100_000.0, Some(100_050.0), 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
+        // Les deux UP, mais exchange montre un mouvement plus large → signal basé sur exchange
+        let signal = evaluate(100_000.0, 100_010.0, Some(100_050.0), 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL);
         assert!(signal.is_some());
         assert_eq!(signal.unwrap().side, Side::Buy);
     }
@@ -473,5 +483,31 @@ mod tests {
         vt.record_move(100_000.0, 100_050.0); // +0.05%
         vt.record_move(100_000.0, 99_950.0);  // -0.05% (évince le premier)
         assert_eq!(vt.recent_moves.len(), 3);
+    }
+
+    // --- divergence Chainlink / exchanges ---
+
+    #[test]
+    fn evaluate_skips_on_direction_divergence() {
+        let config = test_config();
+        let session = Session::default();
+        // Chainlink dit DOWN (-0.05%), exchanges dit UP (+0.05%) → divergence → None
+        let signal = evaluate(
+            100_000.0, 99_950.0, Some(100_050.0),
+            0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL,
+        );
+        assert!(signal.is_none());
+    }
+
+    #[test]
+    fn evaluate_ok_when_both_agree() {
+        let config = test_config();
+        let session = Session::default();
+        // Les deux disent UP → pas de divergence
+        let signal = evaluate(
+            100_000.0, 100_030.0, Some(100_050.0),
+            0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL,
+        );
+        assert!(signal.is_some());
     }
 }

@@ -27,7 +27,11 @@ struct ChainlinkConfig {
     rpc_urls: Vec<String>,
     btc_usd_feed: String,
     poll_interval_ms: u64,
+    #[serde(default = "default_poll_interval_ws")]
+    poll_interval_ms_with_ws: u64,
 }
+
+fn default_poll_interval_ws() -> u64 { 1000 }
 
 #[derive(Deserialize, Default)]
 struct ExchangesConfig {
@@ -113,7 +117,8 @@ async fn main() -> Result<()> {
 
     let config = load_config()?;
     let dry_run = config.strategy.dry_run;
-    let poll_ms = config.chainlink.poll_interval_ms;
+    let poll_ms_base = config.chainlink.poll_interval_ms;
+    let poll_ms_ws = config.chainlink.poll_interval_ms_with_ws;
     let vol_lookback = config.strategy.vol_lookback_intervals;
     let default_vol = config.strategy.default_vol_pct;
     let strat_config = strategy::StrategyConfig::from(config.strategy);
@@ -156,12 +161,15 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Poll Chainlink moins souvent si les exchanges WS sont actifs (fallback only)
+    let poll_ms = if exchange_feed.is_some() { poll_ms_ws } else { poll_ms_base };
+
     tracing::info!("poly5m — Bot d'arbitrage Polymarket 5min BTC{}{}",
         if dry_run { " [DRY-RUN]" } else { "" },
         if exchange_feed.is_some() { " [WS]" } else { "" });
-    tracing::info!("Config: max_bet=${} min_edge={}% entry={}s avant fin | {} RPCs",
+    tracing::info!("Config: max_bet=${} min_edge={}% entry={}s avant fin | {} RPCs | poll={}ms",
         strat_config.max_bet_usdc, strat_config.min_edge_pct,
-        strat_config.entry_seconds_before_end, providers.len());
+        strat_config.entry_seconds_before_end, providers.len(), poll_ms);
 
     // --- Pre-warm : établit TCP+TLS vers tous les endpoints ---
     tracing::info!("Pre-warming connections...");
