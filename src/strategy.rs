@@ -8,6 +8,7 @@ pub struct StrategyConfig {
     pub entry_seconds_before_end: u64,
     pub session_profit_target_usdc: f64,
     pub session_loss_limit_usdc: f64,
+    pub fee_rate_bps: u32,
 }
 
 /// Signal de trade émis par la stratégie.
@@ -87,7 +88,10 @@ pub fn evaluate(
     };
 
     let edge_pct = edge * 100.0;
-    if edge_pct < config.min_edge_pct {
+    let fee = dynamic_fee(market_price, config.fee_rate_bps);
+    let net_edge_pct = edge_pct - (fee * 100.0);
+
+    if net_edge_pct < config.min_edge_pct {
         return None;
     }
 
@@ -98,12 +102,19 @@ pub fn evaluate(
     }
 
     tracing::info!(
-        "SIGNAL: {} | Edge: {:.1}% | Δ prix: {:.4}% | Size: ${:.2} | {}s restantes",
+        "SIGNAL: {} | Edge: {:.1}% (brut {:.1}%, fee {:.2}%) | Δ prix: {:.4}% | Size: ${:.2} | {}s restantes",
         if side == Side::Buy { "BUY UP" } else { "BUY DOWN" },
-        edge_pct, price_change_pct, size, seconds_remaining,
+        net_edge_pct, edge_pct, fee * 100.0, price_change_pct, size, seconds_remaining,
     );
 
-    Some(Signal { side, edge_pct, size_usdc: size, price: market_price })
+    Some(Signal { side, edge_pct: net_edge_pct, size_usdc: size, price: market_price })
+}
+
+/// Calcule les frais dynamiques Polymarket.
+/// fee_rate_bps = 1000 pour les marchés crypto 5min/15min, exponent = 2.
+pub fn dynamic_fee(price: f64, fee_rate_bps: u32) -> f64 {
+    let p_q = price * (1.0 - price);
+    (fee_rate_bps as f64 / 10000.0) * p_q.powi(2)
 }
 
 /// Probabilité UP time-aware basée sur un modèle de volatilité.
@@ -157,6 +168,7 @@ mod tests {
             entry_seconds_before_end: 30,
             session_profit_target_usdc: 100.0,
             session_loss_limit_usdc: 50.0,
+            fee_rate_bps: 1000,
         }
     }
 
@@ -282,5 +294,36 @@ mod tests {
         let session = Session::default();
         assert!(evaluate(100_000.0, 100_050.0, 1.5, 10, &session, &config).is_none());
         assert!(evaluate(100_000.0, 100_050.0, 0.0, 10, &session, &config).is_none());
+    }
+
+    // --- dynamic_fee ---
+
+    #[test]
+    fn dynamic_fee_at_50_50() {
+        let fee = dynamic_fee(0.50, 1000);
+        assert!((fee - 0.00625).abs() < 0.001, "got {fee}");
+    }
+
+    #[test]
+    fn dynamic_fee_at_80_20() {
+        let fee = dynamic_fee(0.80, 1000);
+        // 0.8*0.2 = 0.16, 0.16^2 = 0.0256, * 0.1 = 0.00256
+        assert!(fee < 0.003, "got {fee}");
+    }
+
+    #[test]
+    fn dynamic_fee_at_95_05() {
+        let fee = dynamic_fee(0.95, 1000);
+        assert!(fee < 0.0003, "got {fee}");
+    }
+
+    #[test]
+    fn evaluate_rejects_when_fee_exceeds_edge() {
+        let config = test_config();
+        let session = Session::default();
+        // BTC +0.0005% avec 10s restantes, marché à 50/50
+        // Edge brut ~0.9%, fee ~0.625% → net edge ~0.28% < min_edge 1%
+        let signal = evaluate(100_000.0, 100_000.5, 0.50, 10, &session, &config);
+        assert!(signal.is_none());
     }
 }
