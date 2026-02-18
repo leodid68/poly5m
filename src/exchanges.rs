@@ -78,18 +78,32 @@ impl Exchange {
 }
 
 /// Boucle de reconnexion automatique pour chaque exchange.
+/// Exponential backoff: 2s → 4s → 8s → … → 30s max. Reset on clean disconnect.
 async fn ws_loop(ex: Exchange, url: String, slots: Slots) {
+    let mut backoff_s = 2u64;
+    let mut reconnects = 0u32;
     loop {
-        if let Err(e) = match ex {
+        let result = match ex {
             Exchange::Binance => run_binance(&url, &slots).await,
             Exchange::Coinbase => run_coinbase(&url, &slots).await,
             Exchange::Kraken => run_kraken(&url, &slots).await,
-        } {
-            tracing::warn!("[{}] WS error: {e:#}", ex.label());
-        }
+        };
         // Clear slot on disconnect
         slots.write().unwrap_or_else(|e| e.into_inner())[ex.idx()] = None;
-        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        match result {
+            Ok(()) => {
+                // Clean disconnect — reset backoff
+                tracing::info!("[{}] WS disconnected cleanly", ex.label());
+                backoff_s = 2;
+            }
+            Err(e) => {
+                reconnects += 1;
+                tracing::warn!("[{}] WS error (reconnect #{}): {e:#}", ex.label(), reconnects);
+                backoff_s = (backoff_s * 2).min(30);
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(backoff_s)).await;
     }
 }
 
@@ -101,16 +115,33 @@ struct BinanceTrade { p: String, #[serde(rename = "T")] ts: u64 }
 async fn run_binance(url: &str, slots: &Slots) -> Result<()> {
     let (mut ws, _) = connect_async(url).await.context("connect")?;
     tracing::info!("[Binance] WS connected");
-    while let Some(msg) = ws.next().await {
-        if let Message::Text(ref text) = msg? {
-            if let Ok(t) = serde_json::from_str::<BinanceTrade>(text) {
-                if let Ok(p) = t.p.parse::<f64>() {
-                    slots.write().unwrap_or_else(|e| e.into_inner())[0] = Some(Slot { price: p, updated_ms: t.ts });
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+    ping_interval.tick().await; // skip immediate first tick
+
+    loop {
+        tokio::select! {
+            msg = ws.next() => {
+                match msg {
+                    Some(Ok(Message::Text(ref text))) => {
+                        if let Ok(t) = serde_json::from_str::<BinanceTrade>(text) {
+                            if let Ok(p) = t.p.parse::<f64>() {
+                                slots.write().unwrap_or_else(|e| e.into_inner())[0] = Some(Slot { price: p, updated_ms: t.ts });
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(data))) => {
+                        let _ = ws.send(Message::Pong(data)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => return Err(e.into()),
+                    None => return Ok(()),
                 }
+            }
+            _ = ping_interval.tick() => {
+                ws.send(Message::Ping(vec![].into())).await.context("ping failed")?;
             }
         }
     }
-    Ok(())
 }
 
 // --- Coinbase: wss://ws-feed.exchange.coinbase.com ---
@@ -131,20 +162,37 @@ async fn run_coinbase(url: &str, slots: &Slots) -> Result<()> {
         "product_ids": ["BTC-USD"]
     });
     ws.send(Message::Text(sub.to_string().into())).await?;
-    while let Some(msg) = ws.next().await {
-        if let Message::Text(ref text) = msg? {
-            if let Ok(t) = serde_json::from_str::<CoinbaseTicker>(text) {
-                if t.msg_type == "ticker" {
-                    if let Some(ref ps) = t.price {
-                        if let Ok(p) = ps.parse::<f64>() {
-                            slots.write().unwrap_or_else(|e| e.into_inner())[1] = Some(Slot { price: p, updated_ms: now_ms() });
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+    ping_interval.tick().await; // skip immediate first tick
+
+    loop {
+        tokio::select! {
+            msg = ws.next() => {
+                match msg {
+                    Some(Ok(Message::Text(ref text))) => {
+                        if let Ok(t) = serde_json::from_str::<CoinbaseTicker>(text) {
+                            if t.msg_type == "ticker" {
+                                if let Some(ref ps) = t.price {
+                                    if let Ok(p) = ps.parse::<f64>() {
+                                        slots.write().unwrap_or_else(|e| e.into_inner())[1] = Some(Slot { price: p, updated_ms: now_ms() });
+                                    }
+                                }
+                            }
                         }
                     }
+                    Some(Ok(Message::Ping(data))) => {
+                        let _ = ws.send(Message::Pong(data)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => return Err(e.into()),
+                    None => return Ok(()),
                 }
+            }
+            _ = ping_interval.tick() => {
+                ws.send(Message::Ping(vec![].into())).await.context("ping failed")?;
             }
         }
     }
-    Ok(())
 }
 
 // --- Kraken v2: wss://ws.kraken.com/v2 ---
@@ -163,22 +211,39 @@ async fn run_kraken(url: &str, slots: &Slots) -> Result<()> {
         "params": { "channel": "ticker", "symbol": ["BTC/USD"] }
     });
     ws.send(Message::Text(sub.to_string().into())).await?;
-    while let Some(msg) = ws.next().await {
-        if let Message::Text(ref text) = msg? {
-            if let Ok(m) = serde_json::from_str::<KrakenMsg>(text) {
-                if m.channel.as_deref() == Some("ticker") {
-                    if let Some(ref data) = m.data {
-                        if let Some(t) = data.first() {
-                            if let Some(p) = t.last {
-                                slots.write().unwrap_or_else(|e| e.into_inner())[2] = Some(Slot { price: p, updated_ms: now_ms() });
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+    ping_interval.tick().await; // skip immediate first tick
+
+    loop {
+        tokio::select! {
+            msg = ws.next() => {
+                match msg {
+                    Some(Ok(Message::Text(ref text))) => {
+                        if let Ok(m) = serde_json::from_str::<KrakenMsg>(text) {
+                            if m.channel.as_deref() == Some("ticker") {
+                                if let Some(ref data) = m.data {
+                                    if let Some(t) = data.first() {
+                                        if let Some(p) = t.last {
+                                            slots.write().unwrap_or_else(|e| e.into_inner())[2] = Some(Slot { price: p, updated_ms: now_ms() });
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
+                    Some(Ok(Message::Ping(data))) => {
+                        let _ = ws.send(Message::Pong(data)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => return Err(e.into()),
+                    None => return Ok(()),
                 }
+            }
+            _ = ping_interval.tick() => {
+                ws.send(Message::Ping(vec![].into())).await.context("ping failed")?;
             }
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
