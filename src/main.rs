@@ -258,7 +258,8 @@ async fn main() -> Result<()> {
             }
 
             if let Some((bet_start, bet_side, bet_size, bet_price)) = pending_bet.take() {
-                let went_up = current_btc > bet_start;
+                // Polymarket rule: end_price >= start_price → UP wins (equality = UP)
+                let went_up = resolve_up(bet_start, current_btc);
                 let won = (went_up && bet_side == polymarket::Side::Buy)
                     || (!went_up && bet_side != polymarket::Side::Buy);
                 let pnl = if won {
@@ -420,6 +421,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Resolve whether the 5-min window outcome is UP.
+/// Polymarket rule: end_price >= start_price → UP wins (equality = UP).
+fn resolve_up(start_price: f64, end_price: f64) -> bool {
+    end_price >= start_price
+}
+
 /// Fetch prix Chainlink en RACING parallèle — prend la 1ère réponse.
 async fn fetch_racing(
     providers: &[impl alloy::providers::Provider + Sync],
@@ -434,4 +441,25 @@ async fn fetch_racing(
     let (result, _remaining) = select_ok(futures).await
         .map_err(|e| anyhow::anyhow!("All RPC providers failed: {e}"))?;
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_up_price_higher() {
+        assert!(resolve_up(100_000.0, 100_001.0));
+    }
+
+    #[test]
+    fn resolve_up_price_equal() {
+        // Polymarket rule: equality → UP wins
+        assert!(resolve_up(100_000.0, 100_000.0));
+    }
+
+    #[test]
+    fn resolve_up_price_lower() {
+        assert!(!resolve_up(100_000.0, 99_999.0));
+    }
 }
