@@ -212,7 +212,15 @@ async fn main() -> Result<()> {
     let mut start_price = 0.0f64;
     let mut traded_this_window = false;
     let mut cached_market: Option<polymarket::Market> = None;
-    let mut pending_bet: Option<(f64, polymarket::Side, f64, f64, f64)> = None; // (start_price, side, size, price, fee_pct)
+    struct PendingBet {
+        start_price: f64,
+        side: polymarket::Side,
+        size_usdc: f64,
+        entry_price: f64,
+        fee_pct: f64,
+    }
+
+    let mut pending_bet: Option<PendingBet> = None;
     let mut last_mid = 0.0f64;
     let mut skip_reason = String::from("startup");
     let mut macro_ctx = macro_data::MacroData::default();
@@ -257,12 +265,12 @@ async fn main() -> Result<()> {
                 }
             }
 
-            if let Some((bet_start, bet_side, bet_size, bet_price, bet_fee_pct)) = pending_bet.take() {
+            if let Some(bet) = pending_bet.take() {
                 // Polymarket rule: end_price >= start_price → UP wins (equality = UP)
-                let went_up = resolve_up(bet_start, current_btc);
-                let won = (went_up && bet_side == polymarket::Side::Buy)
-                    || (!went_up && bet_side != polymarket::Side::Buy);
-                let pnl = compute_pnl(won, bet_size, bet_price, bet_fee_pct);
+                let went_up = resolve_up(bet.start_price, current_btc);
+                let won = (went_up && bet.side == polymarket::Side::Buy)
+                    || (!went_up && bet.side != polymarket::Side::Buy);
+                let pnl = compute_pnl(won, bet.size_usdc, bet.entry_price, bet.fee_pct);
                 session.record_trade(pnl);
                 let result_str = if won { "WIN" } else { "LOSS" };
                 tracing::info!(
@@ -270,7 +278,7 @@ async fn main() -> Result<()> {
                     result_str, pnl, session.pnl_usdc, session.win_rate() * 100.0,
                 );
                 if let Some(ref mut csv) = csv {
-                    csv.log_resolution(now, current_window, bet_start, current_btc,
+                    csv.log_resolution(now, current_window, bet.start_price, current_btc,
                         result_str, pnl, session.pnl_usdc, session.trades, session.win_rate() * 100.0);
                 }
             }
@@ -354,11 +362,17 @@ async fn main() -> Result<()> {
         };
 
         // evaluate() : CL price for divergence check, WS price for probability model
-        let signal = match strategy::evaluate(
-            start_price, cl_price.unwrap_or(current_btc), ws_price, market_up_price,
-            remaining, &session, &strat_config, fee_rate_bps, vol_tracker.current_vol(),
-            spread_book.spread,
-        ) {
+        let ctx = strategy::TradeContext {
+            start_price,
+            chainlink_price: cl_price.unwrap_or(current_btc),
+            exchange_price: ws_price,
+            market_up_price,
+            seconds_remaining: remaining,
+            fee_rate_bps,
+            vol_5min_pct: vol_tracker.current_vol(),
+            spread: spread_book.spread,
+        };
+        let signal = match strategy::evaluate(&ctx, &session, &strat_config) {
             Some(s) => s,
             None => {
                 // Track skip reason pour le CSV
@@ -413,7 +427,13 @@ async fn main() -> Result<()> {
         }
 
         if dry_run {
-            pending_bet = Some((start_price, signal.side, signal.size_usdc, entry_price, signal.fee_pct));
+            pending_bet = Some(PendingBet {
+                start_price,
+                side: signal.side,
+                size_usdc: signal.size_usdc,
+                entry_price,
+                fee_pct: signal.fee_pct,
+            });
             traded_this_window = true;
         } else if let Some(ref poly) = poly {
             let order_t = Instant::now();
@@ -423,7 +443,13 @@ async fn main() -> Result<()> {
                     tracing::info!("Ordre placé: {} (status: {}) en {}ms",
                         result.order_id, result.status, order_ms);
                     if result.status == "matched" {
-                        pending_bet = Some((start_price, signal.side, signal.size_usdc, entry_price, signal.fee_pct));
+                        pending_bet = Some(PendingBet {
+                            start_price,
+                            side: signal.side,
+                            size_usdc: signal.size_usdc,
+                            entry_price,
+                            fee_pct: signal.fee_pct,
+                        });
                     } else {
                         tracing::warn!("Ordre non matched (status: {})", result.status);
                     }

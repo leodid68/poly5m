@@ -84,19 +84,25 @@ impl VolTracker {
     }
 }
 
+/// Market context for trade evaluation.
+#[derive(Debug, Clone)]
+pub struct TradeContext {
+    pub start_price: f64,
+    pub chainlink_price: f64,
+    pub exchange_price: Option<f64>,
+    pub market_up_price: f64,
+    pub seconds_remaining: u64,
+    pub fee_rate_bps: u32,
+    pub vol_5min_pct: f64,
+    pub spread: f64,
+}
+
 /// Évalue si on doit trader sur cet intervalle.
 /// `exchange_price` : prix WS exchanges (plus frais), fallback sur `chainlink_price`.
 pub fn evaluate(
-    start_price: f64,
-    chainlink_price: f64,
-    exchange_price: Option<f64>,
-    market_up_price: f64,
-    seconds_remaining: u64,
+    ctx: &TradeContext,
     session: &Session,
     config: &StrategyConfig,
-    fee_rate_bps: u32,
-    vol_5min_pct: f64,
-    spread: f64,
 ) -> Option<Signal> {
     // 1. Session limits
     if session.pnl_usdc >= config.session_profit_target_usdc {
@@ -107,27 +113,28 @@ pub fn evaluate(
     }
 
     // 2. Fenêtre d'entrée
-    if seconds_remaining > config.entry_seconds_before_end {
+    if ctx.seconds_remaining > config.entry_seconds_before_end {
         return None;
     }
 
     // 3. Validation inputs + filtre zone de prix
-    if start_price <= 0.0 || !(0.01..=0.99).contains(&market_up_price) {
+    if ctx.start_price <= 0.0 || !(0.01..=0.99).contains(&ctx.market_up_price) {
         return None;
     }
-    if market_up_price < config.min_market_price || market_up_price > config.max_market_price {
+    if ctx.market_up_price < config.min_market_price || ctx.market_up_price > config.max_market_price {
         return None;
     }
 
     // 4. Cohérence Chainlink / exchanges — skip si divergence directionnelle
     //    Tolérance : si Chainlink est quasi-flat (<0.001%), on fait confiance aux exchanges
-    if let Some(ex_price) = exchange_price {
-        let cl_move_pct = ((chainlink_price - start_price) / start_price).abs();
+    if let Some(ex_price) = ctx.exchange_price {
+        let cl_move_pct = ((ctx.chainlink_price - ctx.start_price) / ctx.start_price).abs();
         if cl_move_pct > 0.00001 {
-            let chainlink_up = chainlink_price > start_price;
-            let exchange_up = ex_price > start_price;
+            let chainlink_up = ctx.chainlink_price > ctx.start_price;
+            let exchange_up = ex_price > ctx.start_price;
             if chainlink_up != exchange_up {
-                tracing::debug!("Skip: divergence CL/WS (CL={chainlink_price:.2}, WS={ex_price:.2}, start={start_price:.2})");
+                tracing::debug!("Skip: divergence CL/WS (CL={:.2}, WS={ex_price:.2}, start={:.2})",
+                    ctx.chainlink_price, ctx.start_price);
                 return None;
             }
         }
@@ -135,18 +142,18 @@ pub fn evaluate(
 
     // 5. Direction et probabilité estimée (time-aware)
     // Préfère le prix exchange (100-200ms plus frais) si disponible
-    let current_price = exchange_price.unwrap_or(chainlink_price);
-    let price_change_pct = (current_price - start_price) / start_price * 100.0;
-    let true_up_prob = price_change_to_probability(price_change_pct, seconds_remaining, vol_5min_pct);
+    let current_price = ctx.exchange_price.unwrap_or(ctx.chainlink_price);
+    let price_change_pct = (current_price - ctx.start_price) / ctx.start_price * 100.0;
+    let true_up_prob = price_change_to_probability(price_change_pct, ctx.seconds_remaining, ctx.vol_5min_pct);
     let true_down_prob = 1.0 - true_up_prob;
-    let market_down_price = 1.0 - market_up_price;
+    let market_down_price = 1.0 - ctx.market_up_price;
 
     // 6. Edge — edge_up = -edge_down toujours, on check juste le signe
-    let edge_up = true_up_prob - market_up_price;
+    let edge_up = true_up_prob - ctx.market_up_price;
     let edge_down = true_down_prob - market_down_price;
 
     let (side, edge, market_price, true_prob) = if edge_up > 0.0 {
-        (Side::Buy, edge_up, market_up_price, true_up_prob)
+        (Side::Buy, edge_up, ctx.market_up_price, true_up_prob)
     } else if edge_down > 0.0 {
         (Side::Sell, edge_down, market_down_price, true_down_prob)
     } else {
@@ -154,8 +161,8 @@ pub fn evaluate(
     };
 
     let edge_pct = edge * 100.0;
-    let fee = dynamic_fee(market_price, fee_rate_bps);
-    let spread_cost = spread / 2.0; // taker pays half the spread
+    let fee = dynamic_fee(market_price, ctx.fee_rate_bps);
+    let spread_cost = ctx.spread / 2.0; // taker pays half the spread
     let net_edge_pct = edge_pct - (fee * 100.0) - (spread_cost * 100.0);
 
     if net_edge_pct < config.min_edge_pct {
@@ -171,8 +178,8 @@ pub fn evaluate(
     tracing::info!(
         "SIGNAL: {} | Edge: {:.1}% (brut {:.1}%, fee {:.2}%) | Δ prix: {:.4}% | Size: ${:.2} | {}s restantes | src: {}",
         if side == Side::Buy { "BUY UP" } else { "BUY DOWN" },
-        net_edge_pct, edge_pct, fee * 100.0, price_change_pct, size, seconds_remaining,
-        if exchange_price.is_some() { "WS" } else { "CL" },
+        net_edge_pct, edge_pct, fee * 100.0, price_change_pct, size, ctx.seconds_remaining,
+        if ctx.exchange_price.is_some() { "WS" } else { "CL" },
     );
 
     Some(Signal {
@@ -248,9 +255,22 @@ mod tests {
         }
     }
 
-    // --- price_change_to_probability ---
-
     const DEFAULT_VOL: f64 = 0.12;
+
+    fn test_ctx() -> TradeContext {
+        TradeContext {
+            start_price: 100_000.0,
+            chainlink_price: 100_000.0,
+            exchange_price: None,
+            market_up_price: 0.50,
+            seconds_remaining: 10,
+            fee_rate_bps: 1000,
+            vol_5min_pct: DEFAULT_VOL,
+            spread: 0.0,
+        }
+    }
+
+    // --- price_change_to_probability ---
 
     #[test]
     fn prob_positive_move_low_time() {
@@ -310,7 +330,8 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // BTC +0.05% avec 10s restantes, marché à 50/50
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0);
+        let ctx = TradeContext { chainlink_price: 100_050.0, ..test_ctx() };
+        let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_some());
         let s = signal.unwrap();
         assert_eq!(s.side, Side::Buy);
@@ -322,7 +343,8 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // BTC -0.05% avec 10s restantes, marché à 50/50
-        let signal = evaluate(100_000.0, 99_950.0, None, 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0);
+        let ctx = TradeContext { chainlink_price: 99_950.0, ..test_ctx() };
+        let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_some());
         let s = signal.unwrap();
         assert_eq!(s.side, Side::Sell); // Sell = buy DOWN token
@@ -333,7 +355,8 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // 60s restantes > entry_seconds_before_end (30)
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.50, 60, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0);
+        let ctx = TradeContext { chainlink_price: 100_050.0, seconds_remaining: 60, ..test_ctx() };
+        let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_none());
     }
 
@@ -342,7 +365,8 @@ mod tests {
         let config = test_config();
         let mut session = Session::default();
         session.pnl_usdc = 100.0; // target atteint
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0);
+        let ctx = TradeContext { chainlink_price: 100_050.0, ..test_ctx() };
+        let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_none());
     }
 
@@ -351,7 +375,8 @@ mod tests {
         let config = test_config();
         let mut session = Session::default();
         session.pnl_usdc = -50.0; // limit atteint
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0);
+        let ctx = TradeContext { chainlink_price: 100_050.0, ..test_ctx() };
+        let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_none());
     }
 
@@ -360,7 +385,8 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // Marché déjà ajusté à 0.99 → edge < 1% (min_edge_pct)
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.99, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0);
+        let ctx = TradeContext { chainlink_price: 100_050.0, market_up_price: 0.99, ..test_ctx() };
+        let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_none());
     }
 
@@ -368,8 +394,10 @@ mod tests {
     fn evaluate_rejects_bad_market_price() {
         let config = test_config();
         let session = Session::default();
-        assert!(evaluate(100_000.0, 100_050.0, None, 1.5, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0).is_none());
-        assert!(evaluate(100_000.0, 100_050.0, None, 0.0, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0).is_none());
+        let ctx1 = TradeContext { chainlink_price: 100_050.0, market_up_price: 1.5, ..test_ctx() };
+        assert!(evaluate(&ctx1, &session, &config).is_none());
+        let ctx2 = TradeContext { chainlink_price: 100_050.0, market_up_price: 0.0, ..test_ctx() };
+        assert!(evaluate(&ctx2, &session, &config).is_none());
     }
 
     // --- dynamic_fee ---
@@ -399,7 +427,8 @@ mod tests {
         let session = Session::default();
         // BTC +0.0005% avec 10s restantes, marché à 50/50
         // Edge brut ~0.9%, fee ~0.625% → net edge ~0.28% < min_edge 1%
-        let signal = evaluate(100_000.0, 100_000.5, None, 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0);
+        let ctx = TradeContext { chainlink_price: 100_000.5, ..test_ctx() };
+        let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_none());
     }
 
@@ -410,7 +439,8 @@ mod tests {
         let config = test_config(); // min=0.15
         let session = Session::default();
         // Marché à 0.10 → en dessous de min_market_price
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.10, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0);
+        let ctx = TradeContext { chainlink_price: 100_050.0, market_up_price: 0.10, ..test_ctx() };
+        let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_none());
     }
 
@@ -419,7 +449,8 @@ mod tests {
         let config = test_config(); // max=0.85
         let session = Session::default();
         // Marché à 0.90 → au dessus de max_market_price
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.90, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0);
+        let ctx = TradeContext { chainlink_price: 100_050.0, market_up_price: 0.90, ..test_ctx() };
+        let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_none());
     }
 
@@ -428,7 +459,8 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // Marché à 0.70, dans la zone autorisée, +0.05% avec 10s restantes
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.70, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0);
+        let ctx = TradeContext { chainlink_price: 100_050.0, market_up_price: 0.70, ..test_ctx() };
+        let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_some());
     }
 
@@ -439,7 +471,12 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // Les deux UP, mais exchange montre un mouvement plus large → signal basé sur exchange
-        let signal = evaluate(100_000.0, 100_010.0, Some(100_050.0), 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0);
+        let ctx = TradeContext {
+            chainlink_price: 100_010.0,
+            exchange_price: Some(100_050.0),
+            ..test_ctx()
+        };
+        let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_some());
         assert_eq!(signal.unwrap().side, Side::Buy);
     }
@@ -449,7 +486,8 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // exchange_price = None → utilise chainlink_price (+0.05%)
-        let signal = evaluate(100_000.0, 100_050.0, None, 0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0);
+        let ctx = TradeContext { chainlink_price: 100_050.0, ..test_ctx() };
+        let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_some());
         assert_eq!(signal.unwrap().side, Side::Buy);
     }
@@ -509,10 +547,12 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // Chainlink dit DOWN (-0.05%), exchanges dit UP (+0.05%) → divergence → None
-        let signal = evaluate(
-            100_000.0, 99_950.0, Some(100_050.0),
-            0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0,
-        );
+        let ctx = TradeContext {
+            chainlink_price: 99_950.0,
+            exchange_price: Some(100_050.0),
+            ..test_ctx()
+        };
+        let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_none());
     }
 
@@ -521,10 +561,12 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // Les deux disent UP → pas de divergence
-        let signal = evaluate(
-            100_000.0, 100_030.0, Some(100_050.0),
-            0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0,
-        );
+        let ctx = TradeContext {
+            chainlink_price: 100_030.0,
+            exchange_price: Some(100_050.0),
+            ..test_ctx()
+        };
+        let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_some());
     }
 
@@ -533,10 +575,11 @@ mod tests {
         let config = test_config();
         let session = Session::default();
         // Chainlink flat (== start), exchange UP → tolérance, pas de divergence
-        let signal = evaluate(
-            100_000.0, 100_000.0, Some(100_050.0),
-            0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL, 0.0,
-        );
+        let ctx = TradeContext {
+            exchange_price: Some(100_050.0),
+            ..test_ctx()
+        };
+        let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_some());
     }
 
@@ -548,17 +591,22 @@ mod tests {
         let session = Session::default();
         // BTC +0.005% with 10s remaining, market at 0.55
         // Edge brut ~4%, fee ~0.6%, net ~3.4% → passes with 0 spread
-        let with_no_spread = evaluate(
-            100_000.0, 100_005.0, None, 0.55, 10,
-            &session, &config, 1000, DEFAULT_VOL, 0.0,
-        );
+        let ctx_no_spread = TradeContext {
+            chainlink_price: 100_005.0,
+            market_up_price: 0.55,
+            ..test_ctx()
+        };
+        let with_no_spread = evaluate(&ctx_no_spread, &session, &config);
         assert!(with_no_spread.is_some(), "should pass with 0 spread");
 
         // With spread=0.06 → spread_cost=3%, net edge ~0.4% < min_edge 1% → rejected
-        let with_spread = evaluate(
-            100_000.0, 100_005.0, None, 0.55, 10,
-            &session, &config, 1000, DEFAULT_VOL, 0.06,
-        );
+        let ctx_spread = TradeContext {
+            chainlink_price: 100_005.0,
+            market_up_price: 0.55,
+            spread: 0.06,
+            ..test_ctx()
+        };
+        let with_spread = evaluate(&ctx_spread, &session, &config);
         assert!(with_spread.is_none(), "spread should kill the edge");
     }
 }
