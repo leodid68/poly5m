@@ -1,5 +1,6 @@
 mod chainlink;
 mod exchanges;
+mod logger;
 mod polymarket;
 mod strategy;
 
@@ -20,6 +21,14 @@ struct Config {
     strategy: StrategyToml,
     #[serde(default)]
     exchanges: ExchangesConfig,
+    #[serde(default)]
+    logging: LoggingConfig,
+}
+
+#[derive(Deserialize, Default)]
+struct LoggingConfig {
+    #[serde(default)]
+    csv_path: String,
 }
 
 #[derive(Deserialize)]
@@ -180,6 +189,15 @@ async fn main() -> Result<()> {
     }
     tracing::info!("Pre-warm done in {}ms", warmup_t.elapsed().as_millis());
 
+    // CSV logger (optionnel)
+    let mut csv = if !config.logging.csv_path.is_empty() {
+        let l = logger::CsvLogger::new(&config.logging.csv_path)?;
+        tracing::info!("CSV logging → {}", config.logging.csv_path);
+        Some(l)
+    } else {
+        None
+    };
+
     let mut session = strategy::Session::default();
     let mut vol_tracker = strategy::VolTracker::new(vol_lookback, default_vol);
     let mut interval = time::interval(Duration::from_millis(poll_ms));
@@ -227,11 +245,14 @@ async fn main() -> Result<()> {
                     -bet_size
                 };
                 session.record_trade(pnl);
+                let result_str = if won { "WIN" } else { "LOSS" };
                 tracing::info!(
                     "Résolution: {} | PnL: ${:.2} | Session: ${:.2} | WR: {:.0}%",
-                    if won { "WIN" } else { "LOSS" },
-                    pnl, session.pnl_usdc, session.win_rate() * 100.0,
+                    result_str, pnl, session.pnl_usdc, session.win_rate() * 100.0,
                 );
+                if let Some(ref mut csv) = csv {
+                    csv.log_resolution(now, current_window, result_str, pnl, session.pnl_usdc);
+                }
             }
 
             // Enregistrer le mouvement de l'intervalle précédent pour la vol dynamique
@@ -305,12 +326,18 @@ async fn main() -> Result<()> {
             None => &dummy_token,
         };
 
-        let side_label = if signal.side == polymarket::Side::Buy { "BUY UP" } else { "BUY DOWN" };
+        let side_label = if signal.side == polymarket::Side::Buy { "BUY_UP" } else { "BUY_DOWN" };
         tracing::info!(
             "{}Placement ordre: {} ${:.2} @ {:.4} (fetch: {}ms)",
             if dry_run { "[DRY-RUN] " } else { "" },
             side_label, signal.size_usdc, signal.price, fetch_ms,
         );
+        if let Some(ref mut csv) = csv {
+            csv.log_trade(
+                now, current_window, price.price_usd, ex_price,
+                market_up_price, side_label, signal.edge_pct, signal.size_usdc, signal.price,
+            );
+        }
 
         if dry_run {
             pending_bet = Some((start_price, signal.side, signal.size_usdc, signal.price));
