@@ -255,6 +255,7 @@ async fn main() -> Result<()> {
                 }
                 Err(e) => {
                     tracing::error!("Erreur ordre: {e:#} ({}ms)", order_t.elapsed().as_millis());
+                    traded_this_window = true; // éviter de spammer l'API en boucle
                 }
             }
         }
