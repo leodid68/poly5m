@@ -1,6 +1,7 @@
 mod chainlink;
 mod exchanges;
 mod logger;
+mod macro_data;
 mod polymarket;
 mod strategy;
 
@@ -198,6 +199,10 @@ async fn main() -> Result<()> {
         None
     };
 
+    let macro_http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()?;
+
     let mut session = strategy::Session::default();
     let mut vol_tracker = strategy::VolTracker::new(vol_lookback, default_vol);
     let mut interval = time::interval(Duration::from_millis(poll_ms));
@@ -208,6 +213,9 @@ async fn main() -> Result<()> {
     let mut traded_this_window = false;
     let mut cached_market: Option<polymarket::Market> = None;
     let mut pending_bet: Option<(f64, polymarket::Side, f64, f64)> = None; // (start_price, side, size, price)
+    let mut last_mid = 0.0f64;
+    let mut skip_reason = String::from("startup");
+    let mut macro_ctx = macro_data::MacroData::default();
 
     loop {
         interval.tick().await;
@@ -217,26 +225,40 @@ async fn main() -> Result<()> {
         let window_end = window + 300;
         let remaining = window_end.saturating_sub(now);
 
-        // Fetch Chainlink AVANT détection window (nécessaire pour résolution)
-        let fetch_t = Instant::now();
-        let price = match fetch_racing(&providers, feed).await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("Chainlink fetch error: {e:#}");
-                continue;
+        // Prix BTC : WS median (primaire), Chainlink (fallback)
+        let ws_agg = exchange_feed.as_ref().map(|ef| ef.latest());
+        let ws_price = ws_agg.filter(|a| a.num_sources > 0).map(|a| a.median_price);
+        let num_ws = ws_agg.map_or(0, |a| a.num_sources);
+
+        let current_btc = match ws_price {
+            Some(p) => p,
+            None => {
+                // Fallback Chainlink on-chain
+                match fetch_racing(&providers, feed).await {
+                    Ok(p) if now <= p.updated_at + 3700 => p.price_usd,
+                    Ok(p) => {
+                        tracing::warn!("No WS, Chainlink stale ({}s ago)", now - p.updated_at);
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!("No price: WS offline, CL error: {e:#}");
+                        continue;
+                    }
+                }
             }
         };
-        let fetch_ms = fetch_t.elapsed().as_millis();
-
-        if now > price.updated_at + 300 {
-            tracing::warn!("Chainlink stale: updated {}s ago", now - price.updated_at);
-            continue;
-        }
 
         // Nouvel intervalle 5min — résoudre le bet précédent
         if window != current_window {
+            // Log skip si le window précédent n'a pas donné de trade
+            if current_window > 0 && !traded_this_window {
+                if let Some(ref mut csv) = csv {
+                    csv.log_skip(now, current_window, start_price, current_btc, last_mid, num_ws, vol_tracker.current_vol(), &macro_ctx, &skip_reason);
+                }
+            }
+
             if let Some((bet_start, bet_side, bet_size, bet_price)) = pending_bet.take() {
-                let went_up = price.price_usd > bet_start;
+                let went_up = current_btc > bet_start;
                 let won = (went_up && bet_side == polymarket::Side::Buy)
                     || (!went_up && bet_side != polymarket::Side::Buy);
                 let pnl = if won {
@@ -251,21 +273,26 @@ async fn main() -> Result<()> {
                     result_str, pnl, session.pnl_usdc, session.win_rate() * 100.0,
                 );
                 if let Some(ref mut csv) = csv {
-                    csv.log_resolution(now, current_window, result_str, pnl, session.pnl_usdc);
+                    csv.log_resolution(now, current_window, bet_start, current_btc,
+                        result_str, pnl, session.pnl_usdc, session.trades, session.win_rate() * 100.0);
                 }
             }
 
             // Enregistrer le mouvement de l'intervalle précédent pour la vol dynamique
             if current_window > 0 && start_price > 0.0 {
-                vol_tracker.record_move(start_price, price.price_usd);
+                vol_tracker.record_move(start_price, current_btc);
             }
 
             current_window = window;
             traded_this_window = false;
-            start_price = price.price_usd;
+            start_price = current_btc;
             cached_market = None;
-            tracing::info!("--- Nouvel intervalle 5min (window={window}) | BTC: ${:.2} | vol: {:.3}% (fetch: {}ms) ---",
-                start_price, vol_tracker.current_vol(), fetch_ms);
+            last_mid = 0.0;
+            skip_reason = String::from("no_entry");
+            macro_ctx = macro_data::fetch(&macro_http).await;
+            let src = if ws_price.is_some() { "WS" } else { "CL" };
+            tracing::info!("--- Nouvel intervalle 5min (window={window}) | BTC: ${:.2} ({src}, {num_ws} src) | vol: {:.3}% | 1h: {:.2}% | 24h: {:.2}% | fund: {:.6} ---",
+                start_price, vol_tracker.current_vol(), macro_ctx.btc_1h_pct, macro_ctx.btc_24h_pct, macro_ctx.funding_rate);
 
             if session.pnl_usdc >= strat_config.session_profit_target_usdc
                 || session.pnl_usdc <= -strat_config.session_loss_limit_usdc
@@ -286,6 +313,7 @@ async fn main() -> Result<()> {
                     Ok(m) => cached_market = Some(m),
                     Err(e) => {
                         tracing::warn!("Marché introuvable: {e:#}");
+                        skip_reason = format!("market_err:{e}");
                         continue;
                     }
                 }
@@ -295,6 +323,7 @@ async fn main() -> Result<()> {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!("Midpoint error: {e:#}");
+                    skip_reason = format!("midpoint_err:{e}");
                     continue;
                 }
             };
@@ -305,37 +334,56 @@ async fn main() -> Result<()> {
             (None, 0.50, strat_config.fee_rate_bps)
         };
 
-        // Prix exchange WS (plus frais que Chainlink) si disponible et non-stale
-        let ex_price = exchange_feed.as_ref()
-            .map(|ef| ef.latest())
-            .filter(|agg| agg.num_sources > 0)
-            .map(|agg| agg.median_price);
+        last_mid = market_up_price;
 
+        // evaluate() : current_btc comme prix principal, pas de split CL/WS
         let signal = match strategy::evaluate(
-            start_price, price.price_usd, ex_price, market_up_price,
+            start_price, current_btc, None, market_up_price,
             remaining, &session, &strat_config, fee_rate_bps, vol_tracker.current_vol(),
         ) {
             Some(s) => s,
-            None => continue,
+            None => {
+                // Track skip reason pour le CSV
+                if market_up_price < strat_config.min_market_price {
+                    skip_reason = format!("mid<{:.2}", strat_config.min_market_price);
+                } else if market_up_price > strat_config.max_market_price {
+                    skip_reason = format!("mid>{:.2}", strat_config.max_market_price);
+                } else {
+                    skip_reason = String::from("no_edge");
+                }
+                continue;
+            }
         };
 
         let dummy_token = "dry-run-token".to_string();
-        let token_id = match &market {
-            Some(m) if signal.side == polymarket::Side::Buy => &m.token_id_yes,
-            Some(m) => &m.token_id_no,
-            None => &dummy_token,
+        let (token_id, token_label) = match &market {
+            Some(m) if signal.side == polymarket::Side::Buy => (&m.token_id_yes, "YES"),
+            Some(m) => (&m.token_id_no, "NO"),
+            None => (&dummy_token, "YES"),
+        };
+
+        // Fetch order book data
+        let book = if let Some(ref poly) = poly {
+            poly.get_book(token_id).await.unwrap_or_default()
+        } else {
+            polymarket::BookData::default()
         };
 
         let side_label = if signal.side == polymarket::Side::Buy { "BUY_UP" } else { "BUY_DOWN" };
         tracing::info!(
-            "{}Placement ordre: {} ${:.2} @ {:.4} (fetch: {}ms)",
+            "{}Placement ordre: {} {} ${:.2} @ {:.4} | BTC=${:.2} ({num_ws} src) | spread={:.4} imbal={:.2}",
             if dry_run { "[DRY-RUN] " } else { "" },
-            side_label, signal.size_usdc, signal.price, fetch_ms,
+            side_label, token_label, signal.size_usdc, signal.price, current_btc,
+            book.spread, book.imbalance,
         );
         if let Some(ref mut csv) = csv {
             csv.log_trade(
-                now, current_window, price.price_usd, ex_price,
-                market_up_price, side_label, signal.edge_pct, signal.size_usdc, signal.price,
+                now, current_window, start_price, current_btc,
+                market_up_price, signal.implied_p_up, side_label, token_label,
+                signal.edge_brut_pct, signal.edge_pct, signal.fee_pct,
+                signal.size_usdc, signal.price, remaining, num_ws, vol_tracker.current_vol(),
+                &macro_ctx, book.spread, book.bid_depth_usdc, book.ask_depth_usdc,
+                book.imbalance, book.num_bid_levels, book.num_ask_levels,
             );
         }
 
@@ -344,8 +392,7 @@ async fn main() -> Result<()> {
             traded_this_window = true;
         } else if let Some(ref poly) = poly {
             let order_t = Instant::now();
-            // Toujours Side::Buy : on achète le token UP ou DOWN, jamais de vente
-            match poly.place_order(token_id, polymarket::Side::Buy, signal.size_usdc, signal.price).await {
+            match poly.place_order(token_id, polymarket::Side::Buy, signal.size_usdc, signal.price, fee_rate_bps).await {
                 Ok(result) => {
                     let order_ms = order_t.elapsed().as_millis();
                     tracing::info!("Ordre placé: {} (status: {}) en {}ms",
@@ -359,11 +406,16 @@ async fn main() -> Result<()> {
                 }
                 Err(e) => {
                     tracing::error!("Erreur ordre: {e:#} ({}ms)", order_t.elapsed().as_millis());
-                    traded_this_window = true; // éviter de spammer l'API en boucle
+                    traded_this_window = true;
                 }
             }
         }
     }
+
+    // Résumé de session
+    tracing::info!("=== SESSION TERMINÉE ===");
+    tracing::info!("Trades: {} | Wins: {} | WR: {:.0}% | PnL: ${:.2}",
+        session.trades, session.wins, session.win_rate() * 100.0, session.pnl_usdc);
 
     Ok(())
 }

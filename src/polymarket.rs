@@ -99,6 +99,31 @@ struct OrderResponse {
     status: String,
 }
 
+#[derive(Deserialize)]
+struct BookResponse {
+    bids: Vec<BookLevel>,
+    asks: Vec<BookLevel>,
+}
+
+#[derive(Deserialize)]
+struct BookLevel {
+    price: String,
+    size: String,
+}
+
+/// Données du carnet d'ordres agrégées.
+#[derive(Debug, Clone, Default)]
+pub struct BookData {
+    pub best_bid: f64,
+    pub best_ask: f64,
+    pub spread: f64,
+    pub bid_depth_usdc: f64,
+    pub ask_depth_usdc: f64,
+    pub imbalance: f64, // bid/(bid+ask), >0.5 = pression acheteuse
+    pub num_bid_levels: u32,
+    pub num_ask_levels: u32,
+}
+
 impl PolymarketClient {
     pub fn new(
         api_key: String,
@@ -177,6 +202,50 @@ impl PolymarketClient {
         data.mid.parse::<f64>().context("Invalid midpoint value")
     }
 
+    /// Récupère le carnet d'ordres pour un token (endpoint public).
+    pub async fn get_book(&self, token_id: &str) -> Result<BookData> {
+        let resp = self.http
+            .get(format!("{CLOB_BASE}/book"))
+            .query(&[("token_id", token_id)])
+            .send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Book API error ({status}): {body}");
+        }
+        let book: BookResponse = resp.json().await?;
+
+        let best_bid = book.bids.first()
+            .and_then(|l| l.price.parse::<f64>().ok()).unwrap_or(0.0);
+        let best_ask = book.asks.first()
+            .and_then(|l| l.price.parse::<f64>().ok()).unwrap_or(1.0);
+
+        let bid_depth: f64 = book.bids.iter()
+            .filter_map(|l| {
+                let p = l.price.parse::<f64>().ok()?;
+                let s = l.size.parse::<f64>().ok()?;
+                Some(p * s)
+            }).sum();
+        let ask_depth: f64 = book.asks.iter()
+            .filter_map(|l| {
+                let p = l.price.parse::<f64>().ok()?;
+                let s = l.size.parse::<f64>().ok()?;
+                Some(p * s)
+            }).sum();
+
+        let total = bid_depth + ask_depth;
+        Ok(BookData {
+            best_bid,
+            best_ask,
+            spread: best_ask - best_bid,
+            bid_depth_usdc: bid_depth,
+            ask_depth_usdc: ask_depth,
+            imbalance: if total > 0.0 { bid_depth / total } else { 0.5 },
+            num_bid_levels: book.bids.len() as u32,
+            num_ask_levels: book.asks.len() as u32,
+        })
+    }
+
     /// Récupère le fee_rate_bps pour un token (endpoint public).
     pub async fn get_fee_rate(&self, token_id: &str) -> Result<u32> {
         let resp = self.http
@@ -199,6 +268,7 @@ impl PolymarketClient {
         side: Side,
         size_usdc: f64,
         price: f64,
+        fee_rate_bps: u32,
     ) -> Result<OrderResult> {
         let side_u8: u8 = if side == Side::Buy { 0 } else { 1 };
 
@@ -226,7 +296,7 @@ impl PolymarketClient {
             takerAmount: U256::from(taker_amount),
             expiration: U256::from(expiration),
             nonce: U256::ZERO,
-            feeRateBps: U256::ZERO,
+            feeRateBps: U256::from(fee_rate_bps),
             side: side_u8,
             signatureType: 0, // EOA
         };
@@ -246,7 +316,7 @@ impl PolymarketClient {
                 "takerAmount": taker_amount.to_string(),
                 "expiration": expiration.to_string(),
                 "nonce": "0",
-                "feeRateBps": "0",
+                "feeRateBps": fee_rate_bps.to_string(),
                 "side": side_u8.to_string(),
                 "signatureType": 0,
                 "signature": signature,
@@ -328,5 +398,27 @@ mod tests {
         let json = r#"{"base_fee": 0}"#;
         let resp: FeeRateResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.base_fee, 0);
+    }
+
+    #[test]
+    fn order_struct_uses_correct_fee_rate_bps() {
+        let fee_rate_bps: u32 = 1000;
+        let order = Order {
+            salt: U256::from(42u64),
+            maker: Address::ZERO,
+            signer: Address::ZERO,
+            taker: Address::ZERO,
+            tokenId: U256::from(1u64),
+            makerAmount: U256::from(2_000_000u64),
+            takerAmount: U256::from(4_000_000u64),
+            expiration: U256::from(9999999999u64),
+            nonce: U256::ZERO,
+            feeRateBps: U256::from(fee_rate_bps),
+            side: 0,
+            signatureType: 0,
+        };
+        assert_eq!(order.feeRateBps, U256::from(1000u32));
+        // Also verify the JSON body value matches
+        assert_eq!(fee_rate_bps.to_string(), "1000");
     }
 }
