@@ -311,3 +311,22 @@ impl PolymarketClient {
         Ok(format!("0x{}", hex::encode(sig.as_bytes())))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_fee_rate_response() {
+        let json = r#"{"base_fee": 1000}"#;
+        let resp: FeeRateResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.base_fee, 1000);
+    }
+
+    #[test]
+    fn parse_fee_rate_zero() {
+        let json = r#"{"base_fee": 0}"#;
+        let resp: FeeRateResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.base_fee, 0);
+    }
+}

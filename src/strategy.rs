@@ -116,12 +116,16 @@ pub fn evaluate(
     }
 
     // 4. Cohérence Chainlink / exchanges — skip si divergence directionnelle
+    //    Tolérance : si Chainlink est quasi-flat (<0.001%), on fait confiance aux exchanges
     if let Some(ex_price) = exchange_price {
-        let chainlink_up = chainlink_price > start_price;
-        let exchange_up = ex_price > start_price;
-        if chainlink_up != exchange_up {
-            tracing::debug!("Skip: divergence CL/WS (CL={chainlink_price:.2}, WS={ex_price:.2}, start={start_price:.2})");
-            return None;
+        let cl_move_pct = ((chainlink_price - start_price) / start_price).abs();
+        if cl_move_pct > 0.00001 {
+            let chainlink_up = chainlink_price > start_price;
+            let exchange_up = ex_price > start_price;
+            if chainlink_up != exchange_up {
+                tracing::debug!("Skip: divergence CL/WS (CL={chainlink_price:.2}, WS={ex_price:.2}, start={start_price:.2})");
+                return None;
+            }
         }
     }
 
@@ -506,6 +510,18 @@ mod tests {
         // Les deux disent UP → pas de divergence
         let signal = evaluate(
             100_000.0, 100_030.0, Some(100_050.0),
+            0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL,
+        );
+        assert!(signal.is_some());
+    }
+
+    #[test]
+    fn evaluate_no_divergence_when_chainlink_flat() {
+        let config = test_config();
+        let session = Session::default();
+        // Chainlink flat (== start), exchange UP → tolérance, pas de divergence
+        let signal = evaluate(
+            100_000.0, 100_000.0, Some(100_050.0),
             0.50, 10, &session, &config, config.fee_rate_bps, DEFAULT_VOL,
         );
         assert!(signal.is_some());

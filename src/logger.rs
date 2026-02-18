@@ -29,11 +29,12 @@ impl CsvLogger {
         price: f64,
     ) {
         let ex = exchange_price.map_or(String::new(), |p| format!("{p:.2}"));
-        let _ = writeln!(
+        if let Err(e) = writeln!(
             self.writer,
             "{timestamp},{window},trade,{chainlink_price:.2},{ex},{market_up_price:.4},{side},{edge_pct:.2},{size_usdc:.2},{price:.4},,,",
-        );
-        let _ = self.writer.flush();
+        ).and_then(|_| self.writer.flush()) {
+            tracing::warn!("CSV write error: {e}");
+        }
     }
 
     /// Log quand un bet est résolu (win/loss).
@@ -45,11 +46,12 @@ impl CsvLogger {
         pnl: f64,
         session_pnl: f64,
     ) {
-        let _ = writeln!(
+        if let Err(e) = writeln!(
             self.writer,
             "{timestamp},{window},resolution,,,,,,,,{result},{pnl:.4},{session_pnl:.4}",
-        );
-        let _ = self.writer.flush();
+        ).and_then(|_| self.writer.flush()) {
+            tracing::warn!("CSV write error: {e}");
+        }
     }
 }
 

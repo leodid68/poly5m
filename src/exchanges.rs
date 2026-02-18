@@ -38,7 +38,7 @@ impl ExchangeFeed {
 
     /// Dernier prix agrégé (médiane des sources fraîches, non-bloquant).
     pub fn latest(&self) -> AggregatedPrice {
-        let slots = self.slots.read().unwrap();
+        let slots = self.slots.read().unwrap_or_else(|e| e.into_inner());
         let now = now_ms();
         let mut prices = Vec::with_capacity(3);
         let mut last = 0u64;
@@ -88,7 +88,7 @@ async fn ws_loop(ex: Exchange, url: String, slots: Slots) {
             tracing::warn!("[{}] WS error: {e:#}", ex.label());
         }
         // Clear slot on disconnect
-        slots.write().unwrap()[ex.idx()] = None;
+        slots.write().unwrap_or_else(|e| e.into_inner())[ex.idx()] = None;
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
@@ -105,7 +105,7 @@ async fn run_binance(url: &str, slots: &Slots) -> Result<()> {
         if let Message::Text(ref text) = msg? {
             if let Ok(t) = serde_json::from_str::<BinanceTrade>(text) {
                 if let Ok(p) = t.p.parse::<f64>() {
-                    slots.write().unwrap()[0] = Some(Slot { price: p, updated_ms: t.ts });
+                    slots.write().unwrap_or_else(|e| e.into_inner())[0] = Some(Slot { price: p, updated_ms: t.ts });
                 }
             }
         }
@@ -137,7 +137,7 @@ async fn run_coinbase(url: &str, slots: &Slots) -> Result<()> {
                 if t.msg_type == "ticker" {
                     if let Some(ref ps) = t.price {
                         if let Ok(p) = ps.parse::<f64>() {
-                            slots.write().unwrap()[1] = Some(Slot { price: p, updated_ms: now_ms() });
+                            slots.write().unwrap_or_else(|e| e.into_inner())[1] = Some(Slot { price: p, updated_ms: now_ms() });
                         }
                     }
                 }
@@ -170,7 +170,7 @@ async fn run_kraken(url: &str, slots: &Slots) -> Result<()> {
                     if let Some(ref data) = m.data {
                         if let Some(t) = data.first() {
                             if let Some(p) = t.last {
-                                slots.write().unwrap()[2] = Some(Slot { price: p, updated_ms: now_ms() });
+                                slots.write().unwrap_or_else(|e| e.into_inner())[2] = Some(Slot { price: p, updated_ms: now_ms() });
                             }
                         }
                     }
@@ -190,7 +190,7 @@ mod tests {
         let slots: Slots = Arc::new(RwLock::new([None; 3]));
         let now = now_ms();
         {
-            let mut s = slots.write().unwrap();
+            let mut s = slots.write().unwrap_or_else(|e| e.into_inner());
             s[0] = Some(Slot { price: 97100.0, updated_ms: now });
             s[1] = Some(Slot { price: 97200.0, updated_ms: now });
             s[2] = Some(Slot { price: 97150.0, updated_ms: now });
@@ -206,7 +206,7 @@ mod tests {
         let slots: Slots = Arc::new(RwLock::new([None; 3]));
         let now = now_ms();
         {
-            let mut s = slots.write().unwrap();
+            let mut s = slots.write().unwrap_or_else(|e| e.into_inner());
             s[0] = Some(Slot { price: 97100.0, updated_ms: now });
             s[1] = Some(Slot { price: 97200.0, updated_ms: now });
         }
@@ -220,7 +220,7 @@ mod tests {
     fn median_one_source() {
         let slots: Slots = Arc::new(RwLock::new([None; 3]));
         let now = now_ms();
-        slots.write().unwrap()[0] = Some(Slot { price: 97100.0, updated_ms: now });
+        slots.write().unwrap_or_else(|e| e.into_inner())[0] = Some(Slot { price: 97100.0, updated_ms: now });
         let feed = ExchangeFeed { slots };
         let agg = feed.latest();
         assert_eq!(agg.num_sources, 1);
@@ -232,7 +232,7 @@ mod tests {
         let slots: Slots = Arc::new(RwLock::new([None; 3]));
         let now = now_ms();
         {
-            let mut s = slots.write().unwrap();
+            let mut s = slots.write().unwrap_or_else(|e| e.into_inner());
             s[0] = Some(Slot { price: 97100.0, updated_ms: now });
             s[1] = Some(Slot { price: 97200.0, updated_ms: now.saturating_sub(10_000) });
         }
