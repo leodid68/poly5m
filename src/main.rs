@@ -43,11 +43,17 @@ struct StrategyToml {
     session_loss_limit_usdc: f64,
     #[serde(default = "default_fee_rate_bps")]
     fee_rate_bps: u32,
+    #[serde(default = "default_min_market_price")]
+    min_market_price: f64,
+    #[serde(default = "default_max_market_price")]
+    max_market_price: f64,
     #[serde(default)]
     dry_run: bool,
 }
 
 fn default_fee_rate_bps() -> u32 { 1000 }
+fn default_min_market_price() -> f64 { 0.15 }
+fn default_max_market_price() -> f64 { 0.85 }
 
 impl From<StrategyToml> for strategy::StrategyConfig {
     fn from(s: StrategyToml) -> Self {
@@ -58,6 +64,8 @@ impl From<StrategyToml> for strategy::StrategyConfig {
             session_profit_target_usdc: s.session_profit_target_usdc,
             session_loss_limit_usdc: s.session_loss_limit_usdc,
             fee_rate_bps: s.fee_rate_bps,
+            min_market_price: s.min_market_price,
+            max_market_price: s.max_market_price,
         }
     }
 }

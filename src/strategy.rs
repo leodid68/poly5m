@@ -9,6 +9,8 @@ pub struct StrategyConfig {
     pub session_profit_target_usdc: f64,
     pub session_loss_limit_usdc: f64,
     pub fee_rate_bps: u32,
+    pub min_market_price: f64,
+    pub max_market_price: f64,
 }
 
 /// Signal de trade émis par la stratégie.
@@ -65,8 +67,11 @@ pub fn evaluate(
         return None;
     }
 
-    // 3. Validation inputs
+    // 3. Validation inputs + filtre zone de prix
     if start_price <= 0.0 || !(0.01..=0.99).contains(&market_up_price) {
+        return None;
+    }
+    if market_up_price < config.min_market_price || market_up_price > config.max_market_price {
         return None;
     }
 
@@ -170,6 +175,8 @@ mod tests {
             session_profit_target_usdc: 100.0,
             session_loss_limit_usdc: 50.0,
             fee_rate_bps: 1000,
+            min_market_price: 0.15,
+            max_market_price: 0.85,
         }
     }
 
@@ -326,5 +333,34 @@ mod tests {
         // Edge brut ~0.9%, fee ~0.625% → net edge ~0.28% < min_edge 1%
         let signal = evaluate(100_000.0, 100_000.5, 0.50, 10, &session, &config, config.fee_rate_bps);
         assert!(signal.is_none());
+    }
+
+    // --- price zone filter ---
+
+    #[test]
+    fn evaluate_rejects_below_min_market_price() {
+        let config = test_config(); // min=0.15
+        let session = Session::default();
+        // Marché à 0.10 → en dessous de min_market_price
+        let signal = evaluate(100_000.0, 100_050.0, 0.10, 10, &session, &config, config.fee_rate_bps);
+        assert!(signal.is_none());
+    }
+
+    #[test]
+    fn evaluate_rejects_above_max_market_price() {
+        let config = test_config(); // max=0.85
+        let session = Session::default();
+        // Marché à 0.90 → au dessus de max_market_price
+        let signal = evaluate(100_000.0, 100_050.0, 0.90, 10, &session, &config, config.fee_rate_bps);
+        assert!(signal.is_none());
+    }
+
+    #[test]
+    fn evaluate_accepts_70_30() {
+        let config = test_config();
+        let session = Session::default();
+        // Marché à 0.70, dans la zone autorisée, +0.05% avec 10s restantes
+        let signal = evaluate(100_000.0, 100_050.0, 0.70, 10, &session, &config, config.fee_rate_bps);
+        assert!(signal.is_some());
     }
 }
