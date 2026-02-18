@@ -18,6 +18,7 @@ sha2 = "0.10"
 base64 = "0.22"
 rand = "0.9"
 futures = "0.3"
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 
 [profile.release]
 opt-level = 3

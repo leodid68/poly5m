@@ -1,4 +1,5 @@
 mod chainlink;
+mod exchanges;
 mod polymarket;
 mod strategy;
 
@@ -17,6 +18,8 @@ struct Config {
     chainlink: ChainlinkConfig,
     polymarket: PolymarketConfig,
     strategy: StrategyToml,
+    #[serde(default)]
+    exchanges: ExchangesConfig,
 }
 
 #[derive(Deserialize)]
@@ -25,6 +28,22 @@ struct ChainlinkConfig {
     btc_usd_feed: String,
     poll_interval_ms: u64,
 }
+
+#[derive(Deserialize, Default)]
+struct ExchangesConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_binance_ws")]
+    binance_ws: String,
+    #[serde(default = "default_coinbase_ws")]
+    coinbase_ws: String,
+    #[serde(default = "default_kraken_ws")]
+    kraken_ws: String,
+}
+
+fn default_binance_ws() -> String { "wss://stream.binance.com:9443/ws/btcusdt@trade".into() }
+fn default_coinbase_ws() -> String { "wss://ws-feed.exchange.coinbase.com".into() }
+fn default_kraken_ws() -> String { "wss://ws.kraken.com/v2".into() }
 
 #[derive(Deserialize)]
 struct PolymarketConfig {
@@ -116,8 +135,22 @@ async fn main() -> Result<()> {
         Err(e) => return Err(e),
     };
 
-    tracing::info!("poly5m — Bot d'arbitrage Polymarket 5min BTC{}",
-        if dry_run { " [DRY-RUN]" } else { "" });
+    // Exchange WebSocket feed (optionnel)
+    let exchange_feed = if config.exchanges.enabled {
+        let ef = exchanges::ExchangeFeed::start(
+            &config.exchanges.binance_ws,
+            &config.exchanges.coinbase_ws,
+            &config.exchanges.kraken_ws,
+        ).await;
+        tracing::info!("Exchange WS feed démarré (Binance + Coinbase + Kraken)");
+        Some(ef)
+    } else {
+        None
+    };
+
+    tracing::info!("poly5m — Bot d'arbitrage Polymarket 5min BTC{}{}",
+        if dry_run { " [DRY-RUN]" } else { "" },
+        if exchange_feed.is_some() { " [WS]" } else { "" });
     tracing::info!("Config: max_bet=${} min_edge={}% entry={}s avant fin | {} RPCs",
         strat_config.max_bet_usdc, strat_config.min_edge_pct,
         strat_config.entry_seconds_before_end, providers.len());
