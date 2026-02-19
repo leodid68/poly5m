@@ -88,12 +88,14 @@ async fn run_rtds(url: &str, symbol: &str, tx: &watch::Sender<Option<RtdsPrice>>
     tracing::info!("[RTDS] WS connected to {url}");
 
     // Subscribe to crypto_prices_chainlink for the symbol
+    // Note: Polymarket RTDS expects filters as a stringified JSON, not a nested object
+    let filters = serde_json::json!({"symbol": symbol}).to_string();
     let sub = serde_json::json!({
         "action": "subscribe",
         "subscriptions": [{
             "topic": "crypto_prices_chainlink",
             "type": "*",
-            "filters": {"symbol": symbol}
+            "filters": filters
         }]
     });
     ws.send(Message::Text(sub.to_string().into())).await?;
