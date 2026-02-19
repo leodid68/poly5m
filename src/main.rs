@@ -70,6 +70,10 @@ struct PolymarketConfig {
 #[derive(Deserialize)]
 struct StrategyToml {
     max_bet_usdc: f64,
+    #[serde(default = "default_min_bet_usdc")]
+    min_bet_usdc: f64,
+    #[serde(default = "default_min_shares")]
+    min_shares: u64,
     min_edge_pct: f64,
     entry_seconds_before_end: u64,
     session_profit_target_usdc: f64,
@@ -92,6 +96,8 @@ struct StrategyToml {
     maker_timeout_s: u64,
 }
 
+fn default_min_bet_usdc() -> f64 { 1.0 }
+fn default_min_shares() -> u64 { 5 }
 fn default_fee_rate_bps() -> u32 { 1000 }
 fn default_min_market_price() -> f64 { 0.15 }
 fn default_max_market_price() -> f64 { 0.85 }
@@ -104,6 +110,8 @@ impl From<StrategyToml> for strategy::StrategyConfig {
     fn from(s: StrategyToml) -> Self {
         Self {
             max_bet_usdc: s.max_bet_usdc,
+            min_bet_usdc: s.min_bet_usdc,
+            min_shares: s.min_shares,
             min_edge_pct: s.min_edge_pct,
             entry_seconds_before_end: s.entry_seconds_before_end,
             session_profit_target_usdc: s.session_profit_target_usdc,

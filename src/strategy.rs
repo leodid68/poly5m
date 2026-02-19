@@ -5,6 +5,8 @@ use std::collections::VecDeque;
 #[derive(Debug, Clone)]
 pub struct StrategyConfig {
     pub max_bet_usdc: f64,
+    pub min_bet_usdc: f64,
+    pub min_shares: u64,
     pub min_edge_pct: f64,
     pub entry_seconds_before_end: u64,
     pub session_profit_target_usdc: f64,
@@ -169,11 +171,28 @@ pub fn evaluate(
         return None;
     }
 
-    // 7. Half-Kelly sizing (max_bet sert de cap, pas de bankroll)
-    let size = half_kelly(true_prob, market_price, config.max_bet_usdc);
-    if size < 0.01 {
+    // 7. Half-Kelly sizing with minimum order constraints
+    let kelly_size = half_kelly(true_prob, market_price, config.max_bet_usdc);
+    if kelly_size <= 0.0 {
         return None;
     }
+    // Polymarket CLOB minimum: min_shares × price, and absolute floor min_bet_usdc
+    let min_usdc = (config.min_shares as f64 * market_price).max(config.min_bet_usdc);
+    if min_usdc > config.max_bet_usdc {
+        tracing::debug!("Skip: min order ${:.2} > max_bet ${:.2}", min_usdc, config.max_bet_usdc);
+        return None;
+    }
+    // Guard: if Kelly recommends <10% of minimum, edge is too marginal to bump
+    if kelly_size < min_usdc * 0.1 {
+        tracing::debug!("Skip: Kelly ${:.2} too marginal vs min ${:.2}", kelly_size, min_usdc);
+        return None;
+    }
+    let size = if kelly_size < min_usdc {
+        tracing::debug!("Kelly ${:.2} bumped to min ${:.2}", kelly_size, min_usdc);
+        min_usdc
+    } else {
+        kelly_size
+    };
 
     tracing::info!(
         "SIGNAL: {} | Edge: {:.1}% (brut {:.1}%, fee {:.2}%) | Δ prix: {:.4}% | Size: ${:.2} | {}s restantes | src: {}",
@@ -245,6 +264,8 @@ mod tests {
     fn test_config() -> StrategyConfig {
         StrategyConfig {
             max_bet_usdc: 2.0,
+            min_bet_usdc: 0.01,
+            min_shares: 0,
             min_edge_pct: 1.0,
             entry_seconds_before_end: 30,
             session_profit_target_usdc: 100.0,
@@ -608,5 +629,218 @@ mod tests {
         };
         let with_spread = evaluate(&ctx_spread, &session, &config);
         assert!(with_spread.is_none(), "spread should kill the edge");
+    }
+
+    // --- minimum order size ---
+
+    #[test]
+    fn evaluate_bumps_to_min_bet_usdc() {
+        let config = StrategyConfig {
+            min_bet_usdc: 1.0,
+            min_shares: 0,
+            ..test_config()
+        };
+        let session = Session::default();
+        // Strong edge → Kelly would size small relative to max_bet, but floor at $1
+        let ctx = TradeContext { chainlink_price: 100_050.0, ..test_ctx() };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_some());
+        assert!(signal.unwrap().size_usdc >= 1.0, "size should be >= $1 min");
+    }
+
+    #[test]
+    fn evaluate_bumps_to_min_shares_constraint() {
+        let config = StrategyConfig {
+            min_bet_usdc: 1.0,
+            min_shares: 5,
+            max_bet_usdc: 10.0,
+            ..test_config()
+        };
+        let session = Session::default();
+        // price=0.50 → 5 shares = $2.50 minimum
+        let ctx = TradeContext { chainlink_price: 100_050.0, ..test_ctx() };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_some());
+        let s = signal.unwrap();
+        assert!(s.size_usdc >= 2.50, "5 shares @ 0.50 = $2.50 min, got ${:.2}", s.size_usdc);
+    }
+
+    #[test]
+    fn evaluate_skips_when_min_exceeds_max_bet() {
+        let config = StrategyConfig {
+            min_bet_usdc: 1.0,
+            min_shares: 5,
+            max_bet_usdc: 2.0, // max=$2, but 5 shares @ 0.50 = $2.50 > max
+            ..test_config()
+        };
+        let session = Session::default();
+        let ctx = TradeContext { chainlink_price: 100_050.0, ..test_ctx() };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_none(), "should skip: min $2.50 > max $2.00");
+    }
+
+    #[test]
+    fn evaluate_normal_kelly_above_min() {
+        let config = StrategyConfig {
+            min_bet_usdc: 1.0,
+            min_shares: 5,
+            max_bet_usdc: 10.0,
+            ..test_config()
+        };
+        let session = Session::default();
+        // Strong edge → Kelly sizes well above minimum
+        let ctx = TradeContext {
+            chainlink_price: 100_050.0, // +0.05%, high confidence at 10s (p≈0.99)
+            market_up_price: 0.50,
+            ..test_ctx()
+        };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_some());
+        let s = signal.unwrap();
+        // Kelly should give >$2.50 with this edge
+        assert!(s.size_usdc >= 2.50);
+    }
+
+    #[test]
+    fn evaluate_skips_marginal_kelly() {
+        // Kelly returns tiny value → <10% of min → skip (don't amplify weak signals)
+        let config = StrategyConfig {
+            min_bet_usdc: 1.0,
+            min_shares: 5,
+            max_bet_usdc: 5.0,
+            min_edge_pct: 0.1, // very low to let marginal signals through to Kelly
+            ..test_config()
+        };
+        let session = Session::default();
+        // Tiny price move at 10s → small Kelly fraction, below 10% of min ($0.25)
+        let ctx = TradeContext {
+            chainlink_price: 100_001.0, // +0.001% → very weak signal
+            market_up_price: 0.50,
+            ..test_ctx()
+        };
+        let signal = evaluate(&ctx, &session, &config);
+        // Kelly should be near-zero, well below 10% of $2.50 min → skip
+        assert!(signal.is_none(), "marginal Kelly should be skipped, not bumped");
+    }
+
+    // --- paper test: realistic $40 portfolio scenarios ---
+
+    fn prod_config() -> StrategyConfig {
+        StrategyConfig {
+            max_bet_usdc: 5.0,
+            min_bet_usdc: 1.0,
+            min_shares: 5,
+            min_edge_pct: 8.0,
+            entry_seconds_before_end: 20,
+            session_profit_target_usdc: 50.0,
+            session_loss_limit_usdc: 20.0,
+            fee_rate_bps: 1000,
+            min_market_price: 0.20,
+            max_market_price: 0.80,
+        }
+    }
+
+    #[test]
+    fn paper_strong_up_signal_20s() {
+        // BTC +0.03% with 20s remaining, market at 0.55, spread 0.02
+        let config = prod_config();
+        let session = Session::default();
+        let ctx = TradeContext {
+            start_price: 100_000.0,
+            chainlink_price: 100_030.0,
+            exchange_price: Some(100_030.0),
+            market_up_price: 0.55,
+            seconds_remaining: 20,
+            fee_rate_bps: 1000,
+            vol_5min_pct: 0.10,
+            spread: 0.02,
+        };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_some(), "should trade with +0.03% at 20s");
+        let s = signal.unwrap();
+        assert_eq!(s.side, Side::Buy);
+        assert!(s.size_usdc >= 1.0 && s.size_usdc <= 5.0,
+            "size ${:.2} should be in $1-$5 range", s.size_usdc);
+        assert!(s.edge_pct >= 8.0, "net edge {:.1}% should be >= 8%", s.edge_pct);
+    }
+
+    #[test]
+    fn paper_weak_signal_rejected() {
+        // BTC +0.005% with 20s remaining → small edge, below min_edge 8%
+        let config = prod_config();
+        let session = Session::default();
+        let ctx = TradeContext {
+            start_price: 100_000.0,
+            chainlink_price: 100_005.0,
+            exchange_price: Some(100_005.0),
+            market_up_price: 0.55,
+            seconds_remaining: 20,
+            fee_rate_bps: 1000,
+            vol_5min_pct: 0.10,
+            spread: 0.02,
+        };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_none(), "weak +0.005% should not pass 8% min edge");
+    }
+
+    #[test]
+    fn paper_high_price_min_shares_binding() {
+        // Market at 0.80 → 5 shares = $4.00 min, close to max_bet $5
+        let config = prod_config();
+        let session = Session::default();
+        let ctx = TradeContext {
+            start_price: 100_000.0,
+            chainlink_price: 100_050.0,
+            exchange_price: Some(100_050.0),
+            market_up_price: 0.80,
+            seconds_remaining: 15,
+            fee_rate_bps: 1000,
+            vol_5min_pct: 0.10,
+            spread: 0.01,
+        };
+        let signal = evaluate(&ctx, &session, &config);
+        if let Some(s) = signal {
+            assert!(s.size_usdc >= 4.0, "min 5 shares @ 0.80 = $4, got ${:.2}", s.size_usdc);
+            assert!(s.size_usdc <= 5.0, "capped at max_bet $5, got ${:.2}", s.size_usdc);
+        }
+    }
+
+    #[test]
+    fn paper_session_loss_limit_40_portfolio() {
+        // After losing $20, session should stop (50% of $40 portfolio)
+        let config = prod_config();
+        let mut session = Session::default();
+        session.pnl_usdc = -20.0;
+        let ctx = TradeContext {
+            start_price: 100_000.0,
+            chainlink_price: 100_050.0,
+            exchange_price: Some(100_050.0),
+            market_up_price: 0.50,
+            seconds_remaining: 15,
+            fee_rate_bps: 1000,
+            vol_5min_pct: 0.10,
+            spread: 0.02,
+        };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_none(), "should stop after -$20 (50% of $40 portfolio)");
+    }
+
+    #[test]
+    fn paper_spread_eats_edge() {
+        // Moderate price move but wide spread kills the net edge below 8%
+        let config = prod_config();
+        let session = Session::default();
+        let ctx = TradeContext {
+            start_price: 100_000.0,
+            chainlink_price: 100_010.0, // +0.01%
+            exchange_price: Some(100_010.0),
+            market_up_price: 0.50,
+            seconds_remaining: 20,
+            fee_rate_bps: 1000,
+            vol_5min_pct: 0.10,
+            spread: 0.15, // 7.5% spread cost → kills ~15% brut edge
+        };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_none(), "wide spread should kill the edge below 8% min");
     }
 }
