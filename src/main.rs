@@ -112,6 +112,10 @@ struct StrategyToml {
     order_type: String,
     #[serde(default = "default_maker_timeout")]
     maker_timeout_s: u64,
+    #[serde(default)]
+    min_delta_pct: f64,
+    #[serde(default = "default_max_spread")]
+    max_spread: f64,
 }
 
 fn default_min_bet_usdc() -> f64 { 1.0 }
@@ -124,6 +128,7 @@ fn default_vol_lookback() -> usize { 20 }
 fn default_vol_pct() -> f64 { 0.12 }
 fn default_order_type() -> String { "FOK".into() }
 fn default_maker_timeout() -> u64 { 5 }
+fn default_max_spread() -> f64 { 0.0 }
 
 impl From<StrategyToml> for strategy::StrategyConfig {
     fn from(s: StrategyToml) -> Self {
@@ -138,6 +143,8 @@ impl From<StrategyToml> for strategy::StrategyConfig {
             fee_rate: s.fee_rate,
             min_market_price: s.min_market_price,
             max_market_price: s.max_market_price,
+            min_delta_pct: s.min_delta_pct,
+            max_spread: s.max_spread,
         }
     }
 }
@@ -425,10 +432,15 @@ async fn main() -> Result<()> {
             Some(s) => s,
             None => {
                 // Track skip reason pour le CSV
+                let price_change_pct = ((current_btc - start_price) / start_price * 100.0).abs();
                 if market_up_price < strat_config.min_market_price {
                     skip_reason = format!("mid<{:.2}", strat_config.min_market_price);
                 } else if market_up_price > strat_config.max_market_price {
                     skip_reason = format!("mid>{:.2}", strat_config.max_market_price);
+                } else if strat_config.min_delta_pct > 0.0 && price_change_pct < strat_config.min_delta_pct {
+                    skip_reason = format!("delta<{:.4}%", strat_config.min_delta_pct);
+                } else if strat_config.max_spread > 0.0 && spread_book.spread > strat_config.max_spread {
+                    skip_reason = format!("spread>{:.2}", strat_config.max_spread);
                 } else {
                     skip_reason = String::from("no_edge");
                 }

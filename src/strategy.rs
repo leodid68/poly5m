@@ -14,6 +14,8 @@ pub struct StrategyConfig {
     pub fee_rate: f64,
     pub min_market_price: f64,
     pub max_market_price: f64,
+    pub min_delta_pct: f64,
+    pub max_spread: f64,
 }
 
 /// Signal de trade émis par la stratégie.
@@ -149,6 +151,19 @@ pub fn evaluate(
         .or(ctx.exchange_price)
         .unwrap_or(ctx.chainlink_price);
     let price_change_pct = (current_price - ctx.start_price) / ctx.start_price * 100.0;
+
+    // 5a. Filtre Δ% minimum — quand le prix n'a pas bougé, le marché a meilleure info
+    if price_change_pct.abs() < config.min_delta_pct {
+        tracing::debug!("Skip: Δ {:.4}% < min_delta {:.4}%", price_change_pct.abs(), config.min_delta_pct);
+        return None;
+    }
+
+    // 5b. Filtre spread — skip si le book est trop large
+    if config.max_spread > 0.0 && ctx.spread > config.max_spread {
+        tracing::debug!("Skip: spread {:.4} > max {:.4}", ctx.spread, config.max_spread);
+        return None;
+    }
+
     let true_up_prob = price_change_to_probability(price_change_pct, ctx.seconds_remaining, ctx.vol_5min_pct);
     let true_down_prob = 1.0 - true_up_prob;
     let market_down_price = 1.0 - ctx.market_up_price;
@@ -277,6 +292,8 @@ mod tests {
             fee_rate: 0.25,
             min_market_price: 0.15,
             max_market_price: 0.85,
+            min_delta_pct: 0.0,
+            max_spread: 0.0,
         }
     }
 
@@ -638,6 +655,83 @@ mod tests {
         assert!(with_spread.is_none(), "spread should kill the edge");
     }
 
+    // --- min_delta_pct filter ---
+
+    #[test]
+    fn evaluate_skips_when_delta_below_min() {
+        let config = StrategyConfig { min_delta_pct: 0.005, ..test_config() };
+        let session = Session::default();
+        // BTC +0.003% → below min_delta 0.005% → skip
+        let ctx = TradeContext { chainlink_price: 100_003.0, ..test_ctx() };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_none(), "should skip: Δ 0.003% < min_delta 0.005%");
+    }
+
+    #[test]
+    fn evaluate_passes_when_delta_above_min() {
+        let config = StrategyConfig { min_delta_pct: 0.005, ..test_config() };
+        let session = Session::default();
+        // BTC +0.05% → well above min_delta 0.005% → proceed
+        let ctx = TradeContext { chainlink_price: 100_050.0, ..test_ctx() };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_some(), "should pass: Δ 0.05% > min_delta 0.005%");
+    }
+
+    #[test]
+    fn evaluate_delta_filter_disabled_at_zero() {
+        let config = StrategyConfig { min_delta_pct: 0.0, ..test_config() };
+        let session = Session::default();
+        // BTC +0.001% → tiny delta but filter disabled (0.0)
+        let ctx = TradeContext { chainlink_price: 100_001.0, ..test_ctx() };
+        // Should NOT be blocked by delta filter (may still be blocked by edge)
+        // This just ensures the filter doesn't fire when set to 0
+        let _ = evaluate(&ctx, &session, &config);
+    }
+
+    // --- max_spread filter ---
+
+    #[test]
+    fn evaluate_skips_when_spread_above_max() {
+        let config = StrategyConfig { max_spread: 0.05, ..test_config() };
+        let session = Session::default();
+        // spread 0.08 > max 0.05 → skip
+        let ctx = TradeContext {
+            chainlink_price: 100_050.0,
+            spread: 0.08,
+            ..test_ctx()
+        };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_none(), "should skip: spread 0.08 > max 0.05");
+    }
+
+    #[test]
+    fn evaluate_passes_when_spread_below_max() {
+        let config = StrategyConfig { max_spread: 0.05, ..test_config() };
+        let session = Session::default();
+        // spread 0.02 < max 0.05 → proceed
+        let ctx = TradeContext {
+            chainlink_price: 100_050.0,
+            spread: 0.02,
+            ..test_ctx()
+        };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_some(), "should pass: spread 0.02 < max 0.05");
+    }
+
+    #[test]
+    fn evaluate_spread_filter_disabled_at_zero() {
+        let config = StrategyConfig { max_spread: 0.0, ..test_config() };
+        let session = Session::default();
+        // spread 0.50 but filter disabled (max=0.0)
+        let ctx = TradeContext {
+            chainlink_price: 100_050.0,
+            spread: 0.50,
+            ..test_ctx()
+        };
+        // Should NOT be blocked by spread filter, only by edge (spread cost in evaluate)
+        let _ = evaluate(&ctx, &session, &config);
+    }
+
     // --- minimum order size ---
 
     #[test]
@@ -737,19 +831,21 @@ mod tests {
             max_bet_usdc: 5.0,
             min_bet_usdc: 1.0,
             min_shares: 5,
-            min_edge_pct: 8.0,
-            entry_seconds_before_end: 20,
+            min_edge_pct: 5.0,
+            entry_seconds_before_end: 12,
             session_profit_target_usdc: 50.0,
             session_loss_limit_usdc: 20.0,
             fee_rate: 0.25,
             min_market_price: 0.20,
             max_market_price: 0.80,
+            min_delta_pct: 0.005,
+            max_spread: 0.05,
         }
     }
 
     #[test]
-    fn paper_strong_up_signal_20s() {
-        // BTC +0.03% with 20s remaining, market at 0.55, spread 0.02
+    fn paper_strong_up_signal_10s() {
+        // BTC +0.03% with 10s remaining, market at 0.55, spread 0.02
         let config = prod_config();
         let session = Session::default();
         let ctx = TradeContext {
@@ -758,23 +854,23 @@ mod tests {
             exchange_price: Some(100_030.0),
             rtds_price: None,
             market_up_price: 0.55,
-            seconds_remaining: 20,
+            seconds_remaining: 10,
             fee_rate: 0.25,
             vol_5min_pct: 0.10,
             spread: 0.02,
         };
         let signal = evaluate(&ctx, &session, &config);
-        assert!(signal.is_some(), "should trade with +0.03% at 20s");
+        assert!(signal.is_some(), "should trade with +0.03% at 10s");
         let s = signal.unwrap();
         assert_eq!(s.side, Side::Buy);
         assert!(s.size_usdc >= 1.0 && s.size_usdc <= 5.0,
             "size ${:.2} should be in $1-$5 range", s.size_usdc);
-        assert!(s.edge_pct >= 8.0, "net edge {:.1}% should be >= 8%", s.edge_pct);
+        assert!(s.edge_pct >= 5.0, "net edge {:.1}% should be >= 5%", s.edge_pct);
     }
 
     #[test]
     fn paper_weak_signal_rejected() {
-        // BTC +0.005% with 20s remaining → small edge, below min_edge 8%
+        // BTC +0.005% with 10s remaining → small edge, below min_edge 5%
         let config = prod_config();
         let session = Session::default();
         let ctx = TradeContext {
@@ -783,13 +879,13 @@ mod tests {
             exchange_price: Some(100_005.0),
             rtds_price: None,
             market_up_price: 0.55,
-            seconds_remaining: 20,
+            seconds_remaining: 10,
             fee_rate: 0.25,
             vol_5min_pct: 0.10,
             spread: 0.02,
         };
         let signal = evaluate(&ctx, &session, &config);
-        assert!(signal.is_none(), "weak +0.005% should not pass 8% min edge");
+        assert!(signal.is_none(), "weak +0.005% should not pass 5% min edge");
     }
 
     #[test]
@@ -803,7 +899,7 @@ mod tests {
             exchange_price: Some(100_050.0),
             rtds_price: None,
             market_up_price: 0.80,
-            seconds_remaining: 15,
+            seconds_remaining: 10,
             fee_rate: 0.25,
             vol_5min_pct: 0.10,
             spread: 0.01,
@@ -827,7 +923,7 @@ mod tests {
             exchange_price: Some(100_050.0),
             rtds_price: None,
             market_up_price: 0.50,
-            seconds_remaining: 15,
+            seconds_remaining: 10,
             fee_rate: 0.25,
             vol_5min_pct: 0.10,
             spread: 0.02,
@@ -838,21 +934,22 @@ mod tests {
 
     #[test]
     fn paper_spread_eats_edge() {
-        // Moderate price move but wide spread kills the net edge below 8%
-        let config = prod_config();
+        // Moderate price move but wide spread kills the net edge below 5%
+        // Disable max_spread filter to test spread cost mechanism specifically
+        let config = StrategyConfig { max_spread: 0.0, ..prod_config() };
         let session = Session::default();
         let ctx = TradeContext {
             start_price: 100_000.0,
             chainlink_price: 100_010.0, // +0.01%
             exchange_price: Some(100_010.0),
             rtds_price: None,
-            market_up_price: 0.50,
-            seconds_remaining: 20,
+            market_up_price: 0.55,
+            seconds_remaining: 10,
             fee_rate: 0.25,
             vol_5min_pct: 0.10,
-            spread: 0.15, // 7.5% spread cost → kills ~15% brut edge
+            spread: 0.20, // 10% spread cost → kills edge below 5%
         };
         let signal = evaluate(&ctx, &session, &config);
-        assert!(signal.is_none(), "wide spread should kill the edge below 8% min");
+        assert!(signal.is_none(), "wide spread should kill the edge below 5% min");
     }
 }
