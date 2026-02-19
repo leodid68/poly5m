@@ -3,6 +3,7 @@ mod exchanges;
 mod logger;
 mod macro_data;
 mod polymarket;
+mod rtds;
 mod strategy;
 
 use alloy::primitives::Address;
@@ -20,6 +21,8 @@ struct Config {
     chainlink: ChainlinkConfig,
     polymarket: PolymarketConfig,
     strategy: StrategyToml,
+    #[serde(default)]
+    rtds: RtdsConfig,
     #[serde(default)]
     exchanges: ExchangesConfig,
     #[serde(default)]
@@ -42,6 +45,19 @@ struct ChainlinkConfig {
 }
 
 fn default_poll_interval_ws() -> u64 { 1000 }
+
+#[derive(Deserialize, Default)]
+struct RtdsConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_rtds_ws")]
+    ws_url: String,
+    #[serde(default = "default_rtds_symbol")]
+    symbol: String,
+}
+
+fn default_rtds_ws() -> String { "wss://ws-live-data.polymarket.com".into() }
+fn default_rtds_symbol() -> String { "btc/usd".into() }
 
 #[derive(Deserialize, Default)]
 struct ExchangesConfig {
@@ -191,11 +207,21 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Poll Chainlink moins souvent si les exchanges WS sont actifs (fallback only)
-    let poll_ms = if exchange_feed.is_some() { poll_ms_ws } else { poll_ms_base };
+    // RTDS feed (Polymarket settlement price, optionnel)
+    let rtds_feed = if config.rtds.enabled {
+        let rf = rtds::RtdsFeed::start(&config.rtds.ws_url, &config.rtds.symbol).await;
+        tracing::info!("RTDS feed démarré ({} / {})", config.rtds.ws_url, config.rtds.symbol);
+        Some(rf)
+    } else {
+        None
+    };
 
-    tracing::info!("poly5m — Bot d'arbitrage Polymarket 5min BTC{}{}",
+    // Poll Chainlink moins souvent si les exchanges WS sont actifs (fallback only)
+    let poll_ms = if exchange_feed.is_some() || rtds_feed.is_some() { poll_ms_ws } else { poll_ms_base };
+
+    tracing::info!("poly5m — Bot d'arbitrage Polymarket 5min BTC{}{}{}",
         if dry_run { " [DRY-RUN]" } else { "" },
+        if rtds_feed.is_some() { " [RTDS]" } else { "" },
         if exchange_feed.is_some() { " [WS]" } else { "" });
     tracing::info!("Config: max_bet=${} min_edge={}% entry={}s | {} RPCs | poll={}ms | order_type={}",
         strat_config.max_bet_usdc, strat_config.min_edge_pct,
@@ -253,25 +279,27 @@ async fn main() -> Result<()> {
         let window_end = window + 300;
         let remaining = window_end.saturating_sub(now);
 
-        // Prix BTC : WS median (primaire), Chainlink (fallback)
+        // Prix BTC : RTDS (settlement, primaire) > WS exchanges > Chainlink on-chain (fallback)
+        let rtds_price = rtds_feed.as_ref().and_then(|rf| rf.latest());
         let ws_agg = exchange_feed.as_ref().map(|ef| ef.latest());
         let ws_price = ws_agg.filter(|a| a.num_sources > 0).map(|a| a.median_price);
         let num_ws = ws_agg.map_or(0, |a| a.num_sources);
 
-        let current_btc = match ws_price {
-            Some(p) => p,
-            None => {
-                // Fallback Chainlink on-chain
-                match fetch_racing(&providers, feed).await {
-                    Ok(p) if now <= p.updated_at + 3700 => p.price_usd,
-                    Ok(p) => {
-                        tracing::warn!("No WS, Chainlink stale ({}s ago)", now - p.updated_at);
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::warn!("No price: WS offline, CL error: {e:#}");
-                        continue;
-                    }
+        let current_btc = if let Some(p) = rtds_price {
+            p
+        } else if let Some(p) = ws_price {
+            p
+        } else {
+            // Fallback Chainlink on-chain
+            match fetch_racing(&providers, feed).await {
+                Ok(p) if now <= p.updated_at + 3700 => p.price_usd,
+                Ok(p) => {
+                    tracing::warn!("No RTDS/WS, Chainlink stale ({}s ago)", now - p.updated_at);
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!("No price: RTDS/WS offline, CL error: {e:#}");
+                    continue;
                 }
             }
         };
@@ -315,7 +343,7 @@ async fn main() -> Result<()> {
             last_mid = 0.0;
             skip_reason = String::from("no_entry");
             macro_ctx = macro_data::fetch(&macro_http).await;
-            let src = if ws_price.is_some() { "WS" } else { "CL" };
+            let src = if rtds_price.is_some() { "RTDS" } else if ws_price.is_some() { "WS" } else { "CL" };
             tracing::info!("--- Nouvel intervalle 5min (window={window}) | BTC: ${:.2} ({src}, {num_ws} src) | vol: {:.3}% | 1h: {:.2}% | 24h: {:.2}% | fund: {:.6} ---",
                 start_price, vol_tracker.current_vol(), macro_ctx.btc_1h_pct, macro_ctx.btc_24h_pct, macro_ctx.funding_rate);
 
