@@ -11,7 +11,7 @@ pub struct StrategyConfig {
     pub entry_seconds_before_end: u64,
     pub session_profit_target_usdc: f64,
     pub session_loss_limit_usdc: f64,
-    pub fee_rate_bps: u32,
+    pub fee_rate: f64,
     pub min_market_price: f64,
     pub max_market_price: f64,
 }
@@ -94,7 +94,7 @@ pub struct TradeContext {
     pub exchange_price: Option<f64>,
     pub market_up_price: f64,
     pub seconds_remaining: u64,
-    pub fee_rate_bps: u32,
+    pub fee_rate: f64,
     pub vol_5min_pct: f64,
     pub spread: f64,
 }
@@ -163,7 +163,7 @@ pub fn evaluate(
     };
 
     let edge_pct = edge * 100.0;
-    let fee = dynamic_fee(market_price, ctx.fee_rate_bps);
+    let fee = dynamic_fee(market_price, ctx.fee_rate);
     let spread_cost = ctx.spread / 2.0; // taker pays half the spread
     let net_edge_pct = edge_pct - (fee * 100.0) - (spread_cost * 100.0);
 
@@ -213,10 +213,11 @@ pub fn evaluate(
 }
 
 /// Calcule les frais dynamiques Polymarket.
-/// fee_rate_bps = 1000 pour les marchés crypto 5min/15min, exponent = 2.
-pub fn dynamic_fee(price: f64, fee_rate_bps: u32) -> f64 {
+/// fee_rate = 0.25 pour les marchés crypto 5min/15min, exponent = 2.
+/// Retourne le fee en fraction du coût (price).
+pub fn dynamic_fee(price: f64, fee_rate: f64) -> f64 {
     let p_q = price * (1.0 - price);
-    (fee_rate_bps as f64 / 10000.0) * p_q.powi(2)
+    fee_rate * p_q.powi(2)
 }
 
 /// Probabilité UP time-aware basée sur un modèle de volatilité.
@@ -270,7 +271,7 @@ mod tests {
             entry_seconds_before_end: 30,
             session_profit_target_usdc: 100.0,
             session_loss_limit_usdc: 50.0,
-            fee_rate_bps: 1000,
+            fee_rate: 0.25,
             min_market_price: 0.15,
             max_market_price: 0.85,
         }
@@ -285,7 +286,7 @@ mod tests {
             exchange_price: None,
             market_up_price: 0.50,
             seconds_remaining: 10,
-            fee_rate_bps: 1000,
+            fee_rate: 0.25,
             vol_5min_pct: DEFAULT_VOL,
             spread: 0.0,
         }
@@ -425,21 +426,23 @@ mod tests {
 
     #[test]
     fn dynamic_fee_at_50_50() {
-        let fee = dynamic_fee(0.50, 1000);
-        assert!((fee - 0.00625).abs() < 0.001, "got {fee}");
+        // fee_rate=0.25, p=0.50: 0.25 × (0.25)^2 = 0.015625 → 1.56%
+        let fee = dynamic_fee(0.50, 0.25);
+        assert!((fee - 0.015625).abs() < 0.0001, "got {fee}");
     }
 
     #[test]
     fn dynamic_fee_at_80_20() {
-        let fee = dynamic_fee(0.80, 1000);
-        // 0.8*0.2 = 0.16, 0.16^2 = 0.0256, * 0.1 = 0.00256
-        assert!(fee < 0.003, "got {fee}");
+        // fee_rate=0.25, p=0.80: 0.25 × (0.16)^2 = 0.0064 → 0.64%
+        let fee = dynamic_fee(0.80, 0.25);
+        assert!((fee - 0.0064).abs() < 0.0001, "got {fee}");
     }
 
     #[test]
     fn dynamic_fee_at_95_05() {
-        let fee = dynamic_fee(0.95, 1000);
-        assert!(fee < 0.0003, "got {fee}");
+        // fee_rate=0.25, p=0.95: 0.25 × (0.0475)^2 = 0.000564 → 0.056%
+        let fee = dynamic_fee(0.95, 0.25);
+        assert!((fee - 0.000564).abs() < 0.0001, "got {fee}");
     }
 
     #[test]
@@ -734,7 +737,7 @@ mod tests {
             entry_seconds_before_end: 20,
             session_profit_target_usdc: 50.0,
             session_loss_limit_usdc: 20.0,
-            fee_rate_bps: 1000,
+            fee_rate: 0.25,
             min_market_price: 0.20,
             max_market_price: 0.80,
         }
@@ -751,7 +754,7 @@ mod tests {
             exchange_price: Some(100_030.0),
             market_up_price: 0.55,
             seconds_remaining: 20,
-            fee_rate_bps: 1000,
+            fee_rate: 0.25,
             vol_5min_pct: 0.10,
             spread: 0.02,
         };
@@ -775,7 +778,7 @@ mod tests {
             exchange_price: Some(100_005.0),
             market_up_price: 0.55,
             seconds_remaining: 20,
-            fee_rate_bps: 1000,
+            fee_rate: 0.25,
             vol_5min_pct: 0.10,
             spread: 0.02,
         };
@@ -794,7 +797,7 @@ mod tests {
             exchange_price: Some(100_050.0),
             market_up_price: 0.80,
             seconds_remaining: 15,
-            fee_rate_bps: 1000,
+            fee_rate: 0.25,
             vol_5min_pct: 0.10,
             spread: 0.01,
         };
@@ -817,7 +820,7 @@ mod tests {
             exchange_price: Some(100_050.0),
             market_up_price: 0.50,
             seconds_remaining: 15,
-            fee_rate_bps: 1000,
+            fee_rate: 0.25,
             vol_5min_pct: 0.10,
             spread: 0.02,
         };
@@ -836,7 +839,7 @@ mod tests {
             exchange_price: Some(100_010.0),
             market_up_price: 0.50,
             seconds_remaining: 20,
-            fee_rate_bps: 1000,
+            fee_rate: 0.25,
             vol_5min_pct: 0.10,
             spread: 0.15, // 7.5% spread cost → kills ~15% brut edge
         };

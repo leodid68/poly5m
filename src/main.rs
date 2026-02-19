@@ -78,6 +78,8 @@ struct StrategyToml {
     entry_seconds_before_end: u64,
     session_profit_target_usdc: f64,
     session_loss_limit_usdc: f64,
+    #[serde(default = "default_fee_rate")]
+    fee_rate: f64,
     #[serde(default = "default_fee_rate_bps")]
     fee_rate_bps: u32,
     #[serde(default = "default_min_market_price")]
@@ -98,6 +100,7 @@ struct StrategyToml {
 
 fn default_min_bet_usdc() -> f64 { 1.0 }
 fn default_min_shares() -> u64 { 5 }
+fn default_fee_rate() -> f64 { 0.25 }
 fn default_fee_rate_bps() -> u32 { 1000 }
 fn default_min_market_price() -> f64 { 0.15 }
 fn default_max_market_price() -> f64 { 0.85 }
@@ -116,7 +119,7 @@ impl From<StrategyToml> for strategy::StrategyConfig {
             entry_seconds_before_end: s.entry_seconds_before_end,
             session_profit_target_usdc: s.session_profit_target_usdc,
             session_loss_limit_usdc: s.session_loss_limit_usdc,
-            fee_rate_bps: s.fee_rate_bps,
+            fee_rate: s.fee_rate,
             min_market_price: s.min_market_price,
             max_market_price: s.max_market_price,
         }
@@ -147,6 +150,7 @@ async fn main() -> Result<()> {
     let default_vol = config.strategy.default_vol_pct;
     let order_type = config.strategy.order_type.clone();
     let maker_timeout_s = config.strategy.maker_timeout_s;
+    let default_fee_rate_bps = config.strategy.fee_rate_bps; // for EIP-712 order signing
     let strat_config = strategy::StrategyConfig::from(config.strategy);
     let feed: Address = config.chainlink.btc_usd_feed.parse().context("Invalid feed address")?;
 
@@ -356,17 +360,17 @@ async fn main() -> Result<()> {
                 }
             };
             let fee = poly.get_fee_rate(&market.token_id_yes).await
-                .unwrap_or(strat_config.fee_rate_bps);
+                .unwrap_or(default_fee_rate_bps);
             (Some(market.clone()), mid, fee)
         } else {
-            (None, 0.50, strat_config.fee_rate_bps)
+            (None, 0.50, default_fee_rate_bps)
         };
 
         last_mid = market_up_price;
 
         tracing::debug!(
             "Fee check: API bps={} | calc={:.4}% | mid={:.4}",
-            fee_rate_bps, strategy::dynamic_fee(market_up_price, fee_rate_bps) * 100.0, market_up_price
+            fee_rate_bps, strategy::dynamic_fee(market_up_price, strat_config.fee_rate) * 100.0, market_up_price
         );
 
         // Fetch book for spread (before evaluate) — always YES token
@@ -384,7 +388,7 @@ async fn main() -> Result<()> {
             exchange_price: ws_price,
             market_up_price,
             seconds_remaining: remaining,
-            fee_rate_bps,
+            fee_rate: strat_config.fee_rate,
             vol_5min_pct: vol_tracker.current_vol(),
             spread: spread_book.spread,
         };
