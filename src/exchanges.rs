@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
-use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::watch;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const STALE_MS: u64 = 5_000;
@@ -20,32 +20,33 @@ struct Slot {
     updated_ms: u64,
 }
 
-type Slots = Arc<RwLock<[Option<Slot>; 3]>>;
-
 pub struct ExchangeFeed {
-    slots: Slots,
+    rx: [watch::Receiver<Option<Slot>>; 3],
 }
 
 impl ExchangeFeed {
     /// Démarre les 3 connexions WS en background. Non-bloquant.
     pub async fn start(binance: &str, coinbase: &str, kraken: &str) -> Self {
-        let slots: Slots = Arc::new(RwLock::new([None; 3]));
-        tokio::spawn(ws_loop(Exchange::Binance, binance.to_string(), Arc::clone(&slots)));
-        tokio::spawn(ws_loop(Exchange::Coinbase, coinbase.to_string(), Arc::clone(&slots)));
-        tokio::spawn(ws_loop(Exchange::Kraken, kraken.to_string(), Arc::clone(&slots)));
-        Self { slots }
+        let (tx0, rx0) = watch::channel(None);
+        let (tx1, rx1) = watch::channel(None);
+        let (tx2, rx2) = watch::channel(None);
+        tokio::spawn(ws_loop(Exchange::Binance, binance.to_string(), tx0));
+        tokio::spawn(ws_loop(Exchange::Coinbase, coinbase.to_string(), tx1));
+        tokio::spawn(ws_loop(Exchange::Kraken, kraken.to_string(), tx2));
+        Self { rx: [rx0, rx1, rx2] }
     }
 
     /// Dernier prix agrégé (médiane des sources fraîches, non-bloquant).
     pub fn latest(&self) -> AggregatedPrice {
-        let slots = self.slots.read().unwrap_or_else(|e| e.into_inner());
         let now = now_ms();
         let mut prices = Vec::with_capacity(3);
         let mut last = 0u64;
-        for slot in slots.iter().flatten() {
-            if now.saturating_sub(slot.updated_ms) < STALE_MS {
-                prices.push(slot.price);
-                last = last.max(slot.updated_ms);
+        for rx in &self.rx {
+            if let Some(slot) = *rx.borrow() {
+                if now.saturating_sub(slot.updated_ms) < STALE_MS {
+                    prices.push(slot.price);
+                    last = last.max(slot.updated_ms);
+                }
             }
         }
         if prices.is_empty() {
@@ -72,24 +73,21 @@ impl Exchange {
     fn label(self) -> &'static str {
         match self { Exchange::Binance => "Binance", Exchange::Coinbase => "Coinbase", Exchange::Kraken => "Kraken" }
     }
-    fn idx(self) -> usize {
-        match self { Exchange::Binance => 0, Exchange::Coinbase => 1, Exchange::Kraken => 2 }
-    }
 }
 
 /// Boucle de reconnexion automatique pour chaque exchange.
 /// Exponential backoff: 2s → 4s → 8s → … → 30s max. Reset on clean disconnect.
-async fn ws_loop(ex: Exchange, url: String, slots: Slots) {
+async fn ws_loop(ex: Exchange, url: String, tx: watch::Sender<Option<Slot>>) {
     let mut backoff_s = 2u64;
     let mut reconnects = 0u32;
     loop {
         let result = match ex {
-            Exchange::Binance => run_binance(&url, &slots).await,
-            Exchange::Coinbase => run_coinbase(&url, &slots).await,
-            Exchange::Kraken => run_kraken(&url, &slots).await,
+            Exchange::Binance => run_binance(&url, &tx).await,
+            Exchange::Coinbase => run_coinbase(&url, &tx).await,
+            Exchange::Kraken => run_kraken(&url, &tx).await,
         };
         // Clear slot on disconnect
-        slots.write().unwrap_or_else(|e| e.into_inner())[ex.idx()] = None;
+        let _ = tx.send(None);
 
         match result {
             Ok(()) => {
@@ -112,7 +110,7 @@ async fn ws_loop(ex: Exchange, url: String, slots: Slots) {
 #[derive(Deserialize)]
 struct BinanceTrade { p: String, #[serde(rename = "T")] ts: u64 }
 
-async fn run_binance(url: &str, slots: &Slots) -> Result<()> {
+async fn run_binance(url: &str, tx: &watch::Sender<Option<Slot>>) -> Result<()> {
     let (mut ws, _) = connect_async(url).await.context("connect")?;
     tracing::info!("[Binance] WS connected");
     let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
@@ -125,7 +123,7 @@ async fn run_binance(url: &str, slots: &Slots) -> Result<()> {
                     Some(Ok(Message::Text(ref text))) => {
                         if let Ok(t) = serde_json::from_str::<BinanceTrade>(text) {
                             if let Ok(p) = t.p.parse::<f64>() {
-                                slots.write().unwrap_or_else(|e| e.into_inner())[0] = Some(Slot { price: p, updated_ms: t.ts });
+                                let _ = tx.send(Some(Slot { price: p, updated_ms: t.ts }));
                             }
                         }
                     }
@@ -153,7 +151,7 @@ struct CoinbaseTicker {
     price: Option<String>,
 }
 
-async fn run_coinbase(url: &str, slots: &Slots) -> Result<()> {
+async fn run_coinbase(url: &str, tx: &watch::Sender<Option<Slot>>) -> Result<()> {
     let (mut ws, _) = connect_async(url).await.context("connect")?;
     tracing::info!("[Coinbase] WS connected");
     let sub = serde_json::json!({
@@ -174,7 +172,7 @@ async fn run_coinbase(url: &str, slots: &Slots) -> Result<()> {
                             if t.msg_type == "ticker" {
                                 if let Some(ref ps) = t.price {
                                     if let Ok(p) = ps.parse::<f64>() {
-                                        slots.write().unwrap_or_else(|e| e.into_inner())[1] = Some(Slot { price: p, updated_ms: now_ms() });
+                                        let _ = tx.send(Some(Slot { price: p, updated_ms: now_ms() }));
                                     }
                                 }
                             }
@@ -203,7 +201,7 @@ struct KrakenMsg { channel: Option<String>, data: Option<Vec<KrakenTicker>> }
 #[derive(Deserialize)]
 struct KrakenTicker { last: Option<f64> }
 
-async fn run_kraken(url: &str, slots: &Slots) -> Result<()> {
+async fn run_kraken(url: &str, tx: &watch::Sender<Option<Slot>>) -> Result<()> {
     let (mut ws, _) = connect_async(url).await.context("connect")?;
     tracing::info!("[Kraken] WS connected");
     let sub = serde_json::json!({
@@ -224,7 +222,7 @@ async fn run_kraken(url: &str, slots: &Slots) -> Result<()> {
                                 if let Some(ref data) = m.data {
                                     if let Some(t) = data.first() {
                                         if let Some(p) = t.last {
-                                            slots.write().unwrap_or_else(|e| e.into_inner())[2] = Some(Slot { price: p, updated_ms: now_ms() });
+                                            let _ = tx.send(Some(Slot { price: p, updated_ms: now_ms() }));
                                         }
                                     }
                                 }
@@ -250,17 +248,25 @@ async fn run_kraken(url: &str, slots: &Slots) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn make_feed(slots: [Option<Slot>; 3]) -> ExchangeFeed {
+        let (tx0, rx0) = watch::channel(slots[0]);
+        let (tx1, rx1) = watch::channel(slots[1]);
+        let (tx2, rx2) = watch::channel(slots[2]);
+        // Keep senders alive for the duration of the test
+        std::mem::forget(tx0);
+        std::mem::forget(tx1);
+        std::mem::forget(tx2);
+        ExchangeFeed { rx: [rx0, rx1, rx2] }
+    }
+
     #[test]
     fn median_three_sources() {
-        let slots: Slots = Arc::new(RwLock::new([None; 3]));
         let now = now_ms();
-        {
-            let mut s = slots.write().unwrap_or_else(|e| e.into_inner());
-            s[0] = Some(Slot { price: 97100.0, updated_ms: now });
-            s[1] = Some(Slot { price: 97200.0, updated_ms: now });
-            s[2] = Some(Slot { price: 97150.0, updated_ms: now });
-        }
-        let feed = ExchangeFeed { slots };
+        let feed = make_feed([
+            Some(Slot { price: 97100.0, updated_ms: now }),
+            Some(Slot { price: 97200.0, updated_ms: now }),
+            Some(Slot { price: 97150.0, updated_ms: now }),
+        ]);
         let agg = feed.latest();
         assert_eq!(agg.num_sources, 3);
         assert!((agg.median_price - 97150.0).abs() < 0.01);
@@ -268,14 +274,12 @@ mod tests {
 
     #[test]
     fn median_two_sources() {
-        let slots: Slots = Arc::new(RwLock::new([None; 3]));
         let now = now_ms();
-        {
-            let mut s = slots.write().unwrap_or_else(|e| e.into_inner());
-            s[0] = Some(Slot { price: 97100.0, updated_ms: now });
-            s[1] = Some(Slot { price: 97200.0, updated_ms: now });
-        }
-        let feed = ExchangeFeed { slots };
+        let feed = make_feed([
+            Some(Slot { price: 97100.0, updated_ms: now }),
+            Some(Slot { price: 97200.0, updated_ms: now }),
+            None,
+        ]);
         let agg = feed.latest();
         assert_eq!(agg.num_sources, 2);
         assert!((agg.median_price - 97150.0).abs() < 0.01);
@@ -283,10 +287,12 @@ mod tests {
 
     #[test]
     fn median_one_source() {
-        let slots: Slots = Arc::new(RwLock::new([None; 3]));
         let now = now_ms();
-        slots.write().unwrap_or_else(|e| e.into_inner())[0] = Some(Slot { price: 97100.0, updated_ms: now });
-        let feed = ExchangeFeed { slots };
+        let feed = make_feed([
+            Some(Slot { price: 97100.0, updated_ms: now }),
+            None,
+            None,
+        ]);
         let agg = feed.latest();
         assert_eq!(agg.num_sources, 1);
         assert!((agg.median_price - 97100.0).abs() < 0.01);
@@ -294,22 +300,19 @@ mod tests {
 
     #[test]
     fn stale_sources_excluded() {
-        let slots: Slots = Arc::new(RwLock::new([None; 3]));
         let now = now_ms();
-        {
-            let mut s = slots.write().unwrap_or_else(|e| e.into_inner());
-            s[0] = Some(Slot { price: 97100.0, updated_ms: now });
-            s[1] = Some(Slot { price: 97200.0, updated_ms: now.saturating_sub(10_000) });
-        }
-        let feed = ExchangeFeed { slots };
+        let feed = make_feed([
+            Some(Slot { price: 97100.0, updated_ms: now }),
+            Some(Slot { price: 97200.0, updated_ms: now.saturating_sub(10_000) }),
+            None,
+        ]);
         let agg = feed.latest();
         assert_eq!(agg.num_sources, 1);
     }
 
     #[test]
     fn no_sources_returns_default() {
-        let slots: Slots = Arc::new(RwLock::new([None; 3]));
-        let feed = ExchangeFeed { slots };
+        let feed = make_feed([None, None, None]);
         let agg = feed.latest();
         assert_eq!(agg.num_sources, 0);
         assert_eq!(agg.median_price, 0.0);
