@@ -16,6 +16,8 @@ pub struct StrategyConfig {
     pub max_market_price: f64,
     pub min_delta_pct: f64,
     pub max_spread: f64,
+    pub kelly_fraction: f64,
+    pub initial_bankroll_usdc: f64,
 }
 
 /// Signal de trade émis par la stratégie.
@@ -30,15 +32,30 @@ pub struct Signal {
     pub price: f64,
 }
 
-/// État de la session (P&L, nombre de trades).
-#[derive(Debug, Default)]
+/// État de la session (P&L, nombre de trades, bankroll tracking).
+#[derive(Debug)]
 pub struct Session {
     pub pnl_usdc: f64,
     pub trades: u32,
     pub wins: u32,
+    pub initial_bankroll: f64,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self { pnl_usdc: 0.0, trades: 0, wins: 0, initial_bankroll: 0.0 }
+    }
 }
 
 impl Session {
+    pub fn new(initial_bankroll: f64) -> Self {
+        Self { pnl_usdc: 0.0, trades: 0, wins: 0, initial_bankroll }
+    }
+
+    pub fn bankroll(&self) -> f64 {
+        self.initial_bankroll + self.pnl_usdc
+    }
+
     pub fn record_trade(&mut self, pnl: f64) {
         self.pnl_usdc += pnl;
         self.trades += 1;
@@ -189,8 +206,12 @@ pub fn evaluate(
         return None;
     }
 
-    // 7. Half-Kelly sizing with minimum order constraints
-    let kelly_size = half_kelly(true_prob, market_price, config.max_bet_usdc);
+    // 7. Fractional Kelly sizing with fee-adjusted payout and bankroll tracking
+    let bankroll = session.bankroll();
+    let kelly_size = fractional_kelly(
+        true_prob, market_price, ctx.fee_rate,
+        config.kelly_fraction, bankroll, config.max_bet_usdc,
+    );
     if kelly_size <= 0.0 {
         return None;
     }
@@ -264,16 +285,21 @@ fn normal_cdf(x: f64) -> f64 {
     if x >= 0.0 { 1.0 - p } else { p }
 }
 
-/// Half-Kelly Criterion : mise conservatrice.
-/// Kelly fraction × max_bet / 2, plafonné à max_bet.
-fn half_kelly(p: f64, price: f64, max_bet: f64) -> f64 {
-    if price <= 0.0 || price >= 1.0 || p <= 0.0 || p >= 1.0 {
+/// Fractional Kelly Criterion with fee-adjusted payout.
+/// Uses b_net = (1-price)/price - fee to account for taker fees in the Kelly formula.
+/// Sizes based on current bankroll, clamped to max_bet.
+fn fractional_kelly(p: f64, price: f64, fee_rate: f64, kelly_fraction: f64, bankroll: f64, max_bet: f64) -> f64 {
+    if price <= 0.0 || price >= 1.0 || p <= 0.0 || p >= 1.0 || bankroll <= 0.0 {
         return 0.0;
     }
-    let b = (1.0 - price) / price;
+    let fee = dynamic_fee(price, fee_rate);
+    let b_net = (1.0 - price) / price - fee;
+    if b_net <= 0.0 {
+        return 0.0;
+    }
     let q = 1.0 - p;
-    let kelly = (b * p - q) / b;
-    ((kelly / 2.0) * max_bet).clamp(0.0, max_bet)
+    let kelly = (b_net * p - q) / b_net;
+    (kelly * kelly_fraction * bankroll).clamp(0.0, max_bet)
 }
 
 #[cfg(test)]
@@ -294,6 +320,8 @@ mod tests {
             max_market_price: 0.85,
             min_delta_pct: 0.0,
             max_spread: 0.0,
+            kelly_fraction: 0.5,
+            initial_bankroll_usdc: 40.0,
         }
     }
 
@@ -346,23 +374,59 @@ mod tests {
         assert!(price_change_to_probability(0.0, 0, DEFAULT_VOL) == 0.5);
     }
 
-    // --- half_kelly ---
+    // --- fractional_kelly ---
 
     #[test]
     fn kelly_positive_edge() {
-        let size = half_kelly(0.7, 0.5, 2.0);
-        assert!(size > 0.0 && size <= 2.0, "got {size}");
+        let size = fractional_kelly(0.7, 0.5, 0.25, 0.5, 40.0, 5.0);
+        assert!(size > 0.0 && size <= 5.0, "got {size}");
     }
 
     #[test]
     fn kelly_no_edge() {
-        let size = half_kelly(0.5, 0.5, 2.0);
+        let size = fractional_kelly(0.5, 0.5, 0.25, 0.5, 40.0, 5.0);
         assert!(size.abs() < 0.001, "got {size}");
     }
 
     #[test]
     fn kelly_bad_odds() {
-        let size = half_kelly(0.3, 0.5, 2.0);
+        let size = fractional_kelly(0.3, 0.5, 0.25, 0.5, 40.0, 5.0);
+        assert!(size.abs() < 0.001, "got {size}");
+    }
+
+    #[test]
+    fn kelly_fraction_proportional() {
+        // Quarter Kelly should be ~half the size of Half Kelly
+        let half = fractional_kelly(0.7, 0.5, 0.25, 0.5, 40.0, 50.0);
+        let quarter = fractional_kelly(0.7, 0.5, 0.25, 0.25, 40.0, 50.0);
+        assert!((half - 2.0 * quarter).abs() < 0.01, "half={half} quarter={quarter}");
+    }
+
+    #[test]
+    fn kelly_fee_adjusted_smaller_than_naive() {
+        // Fee-adjusted Kelly should be smaller than naive (fee_rate=0)
+        let with_fee = fractional_kelly(0.7, 0.5, 0.25, 0.5, 40.0, 50.0);
+        let no_fee = fractional_kelly(0.7, 0.5, 0.0, 0.5, 40.0, 50.0);
+        assert!(with_fee < no_fee, "with_fee={with_fee} should be < no_fee={no_fee}");
+    }
+
+    #[test]
+    fn kelly_bankroll_scales_size() {
+        // Doubling bankroll should double the size (before max_bet clamp)
+        let small = fractional_kelly(0.7, 0.5, 0.25, 0.5, 20.0, 100.0);
+        let large = fractional_kelly(0.7, 0.5, 0.25, 0.5, 40.0, 100.0);
+        assert!((large - 2.0 * small).abs() < 0.01, "large={large} small={small}");
+    }
+
+    #[test]
+    fn kelly_zero_bankroll_returns_zero() {
+        let size = fractional_kelly(0.7, 0.5, 0.25, 0.5, 0.0, 5.0);
+        assert!(size.abs() < 0.001, "got {size}");
+    }
+
+    #[test]
+    fn kelly_negative_bankroll_returns_zero() {
+        let size = fractional_kelly(0.7, 0.5, 0.25, 0.5, -5.0, 5.0);
         assert!(size.abs() < 0.001, "got {size}");
     }
 
@@ -371,7 +435,7 @@ mod tests {
     #[test]
     fn evaluate_buy_up_signal() {
         let config = test_config();
-        let session = Session::default();
+        let session = Session::new(40.0);
         // BTC +0.05% avec 10s restantes, marché à 50/50
         let ctx = TradeContext { chainlink_price: 100_050.0, ..test_ctx() };
         let signal = evaluate(&ctx, &session, &config);
@@ -384,7 +448,7 @@ mod tests {
     #[test]
     fn evaluate_buy_down_signal() {
         let config = test_config();
-        let session = Session::default();
+        let session = Session::new(40.0);
         // BTC -0.05% avec 10s restantes, marché à 50/50
         let ctx = TradeContext { chainlink_price: 99_950.0, ..test_ctx() };
         let signal = evaluate(&ctx, &session, &config);
@@ -396,7 +460,7 @@ mod tests {
     #[test]
     fn evaluate_no_signal_outside_window() {
         let config = test_config();
-        let session = Session::default();
+        let session = Session::new(40.0);
         // 60s restantes > entry_seconds_before_end (30)
         let ctx = TradeContext { chainlink_price: 100_050.0, seconds_remaining: 60, ..test_ctx() };
         let signal = evaluate(&ctx, &session, &config);
@@ -406,7 +470,7 @@ mod tests {
     #[test]
     fn evaluate_no_signal_profit_target() {
         let config = test_config();
-        let mut session = Session::default();
+        let mut session = Session::new(40.0);
         session.pnl_usdc = 100.0; // target atteint
         let ctx = TradeContext { chainlink_price: 100_050.0, ..test_ctx() };
         let signal = evaluate(&ctx, &session, &config);
@@ -416,7 +480,7 @@ mod tests {
     #[test]
     fn evaluate_no_signal_loss_limit() {
         let config = test_config();
-        let mut session = Session::default();
+        let mut session = Session::new(40.0);
         session.pnl_usdc = -50.0; // limit atteint
         let ctx = TradeContext { chainlink_price: 100_050.0, ..test_ctx() };
         let signal = evaluate(&ctx, &session, &config);
@@ -426,7 +490,7 @@ mod tests {
     #[test]
     fn evaluate_no_signal_low_edge() {
         let config = test_config();
-        let session = Session::default();
+        let session = Session::new(40.0);
         // Marché déjà ajusté à 0.99 → edge < 1% (min_edge_pct)
         let ctx = TradeContext { chainlink_price: 100_050.0, market_up_price: 0.99, ..test_ctx() };
         let signal = evaluate(&ctx, &session, &config);
@@ -436,7 +500,7 @@ mod tests {
     #[test]
     fn evaluate_rejects_bad_market_price() {
         let config = test_config();
-        let session = Session::default();
+        let session = Session::new(40.0);
         let ctx1 = TradeContext { chainlink_price: 100_050.0, market_up_price: 1.5, ..test_ctx() };
         assert!(evaluate(&ctx1, &session, &config).is_none());
         let ctx2 = TradeContext { chainlink_price: 100_050.0, market_up_price: 0.0, ..test_ctx() };
@@ -469,7 +533,7 @@ mod tests {
     #[test]
     fn evaluate_rejects_when_fee_exceeds_edge() {
         let config = test_config();
-        let session = Session::default();
+        let session = Session::new(40.0);
         // BTC +0.0005% avec 10s restantes, marché à 50/50
         // Edge brut ~0.9%, fee ~0.625% → net edge ~0.28% < min_edge 1%
         let ctx = TradeContext { chainlink_price: 100_000.5, ..test_ctx() };
@@ -482,7 +546,7 @@ mod tests {
     #[test]
     fn evaluate_rejects_below_min_market_price() {
         let config = test_config(); // min=0.15
-        let session = Session::default();
+        let session = Session::new(40.0);
         // Marché à 0.10 → en dessous de min_market_price
         let ctx = TradeContext { chainlink_price: 100_050.0, market_up_price: 0.10, ..test_ctx() };
         let signal = evaluate(&ctx, &session, &config);
@@ -492,7 +556,7 @@ mod tests {
     #[test]
     fn evaluate_rejects_above_max_market_price() {
         let config = test_config(); // max=0.85
-        let session = Session::default();
+        let session = Session::new(40.0);
         // Marché à 0.90 → au dessus de max_market_price
         let ctx = TradeContext { chainlink_price: 100_050.0, market_up_price: 0.90, ..test_ctx() };
         let signal = evaluate(&ctx, &session, &config);
@@ -502,7 +566,7 @@ mod tests {
     #[test]
     fn evaluate_accepts_70_30() {
         let config = test_config();
-        let session = Session::default();
+        let session = Session::new(40.0);
         // Marché à 0.70, dans la zone autorisée, +0.05% avec 10s restantes
         let ctx = TradeContext { chainlink_price: 100_050.0, market_up_price: 0.70, ..test_ctx() };
         let signal = evaluate(&ctx, &session, &config);
@@ -514,7 +578,7 @@ mod tests {
     #[test]
     fn evaluate_uses_exchange_price_when_provided() {
         let config = test_config();
-        let session = Session::default();
+        let session = Session::new(40.0);
         // Les deux UP, mais exchange montre un mouvement plus large → signal basé sur exchange
         let ctx = TradeContext {
             chainlink_price: 100_010.0,
@@ -529,7 +593,7 @@ mod tests {
     #[test]
     fn evaluate_falls_back_to_chainlink_when_no_exchange() {
         let config = test_config();
-        let session = Session::default();
+        let session = Session::new(40.0);
         // exchange_price = None → utilise chainlink_price (+0.05%)
         let ctx = TradeContext { chainlink_price: 100_050.0, ..test_ctx() };
         let signal = evaluate(&ctx, &session, &config);
@@ -590,7 +654,7 @@ mod tests {
     #[test]
     fn evaluate_skips_on_direction_divergence() {
         let config = test_config();
-        let session = Session::default();
+        let session = Session::new(40.0);
         // Chainlink dit DOWN (-0.05%), exchanges dit UP (+0.05%) → divergence → None
         let ctx = TradeContext {
             chainlink_price: 99_950.0,
@@ -604,7 +668,7 @@ mod tests {
     #[test]
     fn evaluate_ok_when_both_agree() {
         let config = test_config();
-        let session = Session::default();
+        let session = Session::new(40.0);
         // Les deux disent UP → pas de divergence
         let ctx = TradeContext {
             chainlink_price: 100_030.0,
@@ -618,7 +682,7 @@ mod tests {
     #[test]
     fn evaluate_no_divergence_when_chainlink_flat() {
         let config = test_config();
-        let session = Session::default();
+        let session = Session::new(40.0);
         // Chainlink flat (== start), exchange UP → tolérance, pas de divergence
         let ctx = TradeContext {
             exchange_price: Some(100_050.0),
@@ -633,7 +697,7 @@ mod tests {
     #[test]
     fn evaluate_rejects_when_spread_kills_edge() {
         let config = test_config();
-        let session = Session::default();
+        let session = Session::new(40.0);
         // BTC +0.005% with 10s remaining, market at 0.55
         // Edge brut ~4%, fee ~0.6%, net ~3.4% → passes with 0 spread
         let ctx_no_spread = TradeContext {
@@ -660,7 +724,7 @@ mod tests {
     #[test]
     fn evaluate_skips_when_delta_below_min() {
         let config = StrategyConfig { min_delta_pct: 0.005, ..test_config() };
-        let session = Session::default();
+        let session = Session::new(40.0);
         // BTC +0.003% → below min_delta 0.005% → skip
         let ctx = TradeContext { chainlink_price: 100_003.0, ..test_ctx() };
         let signal = evaluate(&ctx, &session, &config);
@@ -670,7 +734,7 @@ mod tests {
     #[test]
     fn evaluate_passes_when_delta_above_min() {
         let config = StrategyConfig { min_delta_pct: 0.005, ..test_config() };
-        let session = Session::default();
+        let session = Session::new(40.0);
         // BTC +0.05% → well above min_delta 0.005% → proceed
         let ctx = TradeContext { chainlink_price: 100_050.0, ..test_ctx() };
         let signal = evaluate(&ctx, &session, &config);
@@ -680,7 +744,7 @@ mod tests {
     #[test]
     fn evaluate_delta_filter_disabled_at_zero() {
         let config = StrategyConfig { min_delta_pct: 0.0, ..test_config() };
-        let session = Session::default();
+        let session = Session::new(40.0);
         // BTC +0.001% → tiny delta but filter disabled (0.0)
         let ctx = TradeContext { chainlink_price: 100_001.0, ..test_ctx() };
         // Should NOT be blocked by delta filter (may still be blocked by edge)
@@ -693,7 +757,7 @@ mod tests {
     #[test]
     fn evaluate_skips_when_spread_above_max() {
         let config = StrategyConfig { max_spread: 0.05, ..test_config() };
-        let session = Session::default();
+        let session = Session::new(40.0);
         // spread 0.08 > max 0.05 → skip
         let ctx = TradeContext {
             chainlink_price: 100_050.0,
@@ -707,7 +771,7 @@ mod tests {
     #[test]
     fn evaluate_passes_when_spread_below_max() {
         let config = StrategyConfig { max_spread: 0.05, ..test_config() };
-        let session = Session::default();
+        let session = Session::new(40.0);
         // spread 0.02 < max 0.05 → proceed
         let ctx = TradeContext {
             chainlink_price: 100_050.0,
@@ -721,7 +785,7 @@ mod tests {
     #[test]
     fn evaluate_spread_filter_disabled_at_zero() {
         let config = StrategyConfig { max_spread: 0.0, ..test_config() };
-        let session = Session::default();
+        let session = Session::new(40.0);
         // spread 0.50 but filter disabled (max=0.0)
         let ctx = TradeContext {
             chainlink_price: 100_050.0,
@@ -741,7 +805,7 @@ mod tests {
             min_shares: 0,
             ..test_config()
         };
-        let session = Session::default();
+        let session = Session::new(40.0);
         // Strong edge → Kelly would size small relative to max_bet, but floor at $1
         let ctx = TradeContext { chainlink_price: 100_050.0, ..test_ctx() };
         let signal = evaluate(&ctx, &session, &config);
@@ -757,7 +821,7 @@ mod tests {
             max_bet_usdc: 10.0,
             ..test_config()
         };
-        let session = Session::default();
+        let session = Session::new(40.0);
         // price=0.50 → 5 shares = $2.50 minimum
         let ctx = TradeContext { chainlink_price: 100_050.0, ..test_ctx() };
         let signal = evaluate(&ctx, &session, &config);
@@ -774,7 +838,7 @@ mod tests {
             max_bet_usdc: 2.0, // max=$2, but 5 shares @ 0.50 = $2.50 > max
             ..test_config()
         };
-        let session = Session::default();
+        let session = Session::new(40.0);
         let ctx = TradeContext { chainlink_price: 100_050.0, ..test_ctx() };
         let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_none(), "should skip: min $2.50 > max $2.00");
@@ -788,7 +852,7 @@ mod tests {
             max_bet_usdc: 10.0,
             ..test_config()
         };
-        let session = Session::default();
+        let session = Session::new(40.0);
         // Strong edge → Kelly sizes well above minimum
         let ctx = TradeContext {
             chainlink_price: 100_050.0, // +0.05%, high confidence at 10s (p≈0.99)
@@ -812,10 +876,10 @@ mod tests {
             min_edge_pct: 0.1, // very low to let marginal signals through to Kelly
             ..test_config()
         };
-        let session = Session::default();
+        let session = Session::new(40.0);
         // Tiny price move at 10s → small Kelly fraction, below 10% of min ($0.25)
         let ctx = TradeContext {
-            chainlink_price: 100_001.0, // +0.001% → very weak signal
+            chainlink_price: 100_000.5, // +0.0005% → very weak signal
             market_up_price: 0.50,
             ..test_ctx()
         };
@@ -840,6 +904,8 @@ mod tests {
             max_market_price: 0.80,
             min_delta_pct: 0.005,
             max_spread: 0.05,
+            kelly_fraction: 0.25,
+            initial_bankroll_usdc: 40.0,
         }
     }
 
@@ -847,7 +913,7 @@ mod tests {
     fn paper_strong_up_signal_10s() {
         // BTC +0.03% with 10s remaining, market at 0.55, spread 0.02
         let config = prod_config();
-        let session = Session::default();
+        let session = Session::new(40.0);
         let ctx = TradeContext {
             start_price: 100_000.0,
             chainlink_price: 100_030.0,
@@ -872,7 +938,7 @@ mod tests {
     fn paper_weak_signal_rejected() {
         // BTC +0.005% with 10s remaining → small edge, below min_edge 5%
         let config = prod_config();
-        let session = Session::default();
+        let session = Session::new(40.0);
         let ctx = TradeContext {
             start_price: 100_000.0,
             chainlink_price: 100_005.0,
@@ -892,7 +958,7 @@ mod tests {
     fn paper_high_price_min_shares_binding() {
         // Market at 0.80 → 5 shares = $4.00 min, close to max_bet $5
         let config = prod_config();
-        let session = Session::default();
+        let session = Session::new(40.0);
         let ctx = TradeContext {
             start_price: 100_000.0,
             chainlink_price: 100_050.0,
@@ -915,7 +981,7 @@ mod tests {
     fn paper_session_loss_limit_40_portfolio() {
         // After losing $20, session should stop (50% of $40 portfolio)
         let config = prod_config();
-        let mut session = Session::default();
+        let mut session = Session::new(40.0);
         session.pnl_usdc = -20.0;
         let ctx = TradeContext {
             start_price: 100_000.0,
@@ -937,7 +1003,7 @@ mod tests {
         // Moderate price move but wide spread kills the net edge below 5%
         // Disable max_spread filter to test spread cost mechanism specifically
         let config = StrategyConfig { max_spread: 0.0, ..prod_config() };
-        let session = Session::default();
+        let session = Session::new(40.0);
         let ctx = TradeContext {
             start_price: 100_000.0,
             chainlink_price: 100_010.0, // +0.01%
@@ -951,5 +1017,46 @@ mod tests {
         };
         let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_none(), "wide spread should kill the edge below 5% min");
+    }
+
+    // --- Session bankroll tracking ---
+
+    #[test]
+    fn session_bankroll_tracks_pnl() {
+        let mut s = Session::new(40.0);
+        assert!((s.bankroll() - 40.0).abs() < 0.001);
+        s.record_trade(5.0);
+        assert!((s.bankroll() - 45.0).abs() < 0.001);
+        s.record_trade(-3.0);
+        assert!((s.bankroll() - 42.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn session_default_has_zero_bankroll() {
+        let s = Session::default();
+        assert!((s.bankroll()).abs() < 0.001);
+    }
+
+    // --- bankroll-aware sizing in evaluate ---
+
+    #[test]
+    fn evaluate_reduces_size_after_losses() {
+        let config = test_config();
+        let ctx = TradeContext { chainlink_price: 100_050.0, ..test_ctx() };
+
+        // Full bankroll
+        let session_full = Session::new(40.0);
+        let sig_full = evaluate(&ctx, &session_full, &config);
+
+        // Half bankroll (after losses)
+        let mut session_half = Session::new(40.0);
+        session_half.pnl_usdc = -20.0; // bankroll = 20
+        let sig_half = evaluate(&ctx, &session_half, &config);
+
+        assert!(sig_full.is_some());
+        assert!(sig_half.is_some());
+        // Size should be smaller with less bankroll (or bumped to min, either way <= full)
+        assert!(sig_half.unwrap().size_usdc <= sig_full.unwrap().size_usdc,
+            "size should decrease with bankroll losses");
     }
 }

@@ -116,6 +116,10 @@ struct StrategyToml {
     min_delta_pct: f64,
     #[serde(default = "default_max_spread")]
     max_spread: f64,
+    #[serde(default = "default_kelly_fraction")]
+    kelly_fraction: f64,
+    #[serde(default = "default_initial_bankroll")]
+    initial_bankroll_usdc: f64,
 }
 
 fn default_min_bet_usdc() -> f64 { 1.0 }
@@ -129,6 +133,8 @@ fn default_vol_pct() -> f64 { 0.12 }
 fn default_order_type() -> String { "FOK".into() }
 fn default_maker_timeout() -> u64 { 5 }
 fn default_max_spread() -> f64 { 0.0 }
+fn default_kelly_fraction() -> f64 { 0.25 }
+fn default_initial_bankroll() -> f64 { 40.0 }
 
 impl From<StrategyToml> for strategy::StrategyConfig {
     fn from(s: StrategyToml) -> Self {
@@ -145,6 +151,8 @@ impl From<StrategyToml> for strategy::StrategyConfig {
             max_market_price: s.max_market_price,
             min_delta_pct: s.min_delta_pct,
             max_spread: s.max_spread,
+            kelly_fraction: s.kelly_fraction,
+            initial_bankroll_usdc: s.initial_bankroll_usdc,
         }
     }
 }
@@ -256,7 +264,7 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(3))
         .build()?;
 
-    let mut session = strategy::Session::default();
+    let mut session = strategy::Session::new(strat_config.initial_bankroll_usdc);
     let mut vol_tracker = strategy::VolTracker::new(vol_lookback, default_vol);
     let mut interval = time::interval(Duration::from_millis(poll_ms));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -580,14 +588,13 @@ fn resolve_up(start_price: f64, end_price: f64) -> bool {
     end_price >= start_price
 }
 
-/// Compute PnL for a resolved bet, subtracting the entry fee on wins.
-/// On loss, the fee is already included in the -size (total loss).
+/// Compute PnL for a resolved bet. Taker fee is paid at entry regardless of outcome.
 fn compute_pnl(won: bool, size: f64, price: f64, fee_pct: f64) -> f64 {
     let fee_cost = size * fee_pct / 100.0;
     if won {
         size * (1.0 / price - 1.0) - fee_cost
     } else {
-        -size
+        -size - fee_cost
     }
 }
 
@@ -638,11 +645,12 @@ mod tests {
     }
 
     #[test]
-    fn pnl_loss_no_fee_deduction() {
+    fn pnl_loss_includes_fee() {
         let size = 2.0;
         let price = 0.65;
         let fee_pct = 0.52;
         let pnl = compute_pnl(false, size, price, fee_pct);
-        assert!((pnl - (-size)).abs() < 1e-10, "loss pnl should be -size, got {pnl}");
+        let expected = -size - size * 0.0052;
+        assert!((pnl - expected).abs() < 1e-10, "loss pnl should be -size-fee, got {pnl}");
     }
 }
