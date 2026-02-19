@@ -2,150 +2,162 @@
 
 ## Vue d'ensemble
 
-Bot Rust qui exploite le décalage entre les données Chainlink (oracle) et les prix affichés sur les marchés 5 minutes de Polymarket pour le BTC.
+Bot Rust qui exploite le décalage entre les prix d'oracle (Chainlink Data Streams) et les prix affichés sur les marchés binaires 5 minutes de Polymarket pour le BTC (UP/DOWN).
 
-**Principe** : Polymarket utilise Chainlink Data Feeds pour résoudre ses marchés 5 minutes (BTC UP/DOWN). Les market makers ajustent leurs prix avec un léger retard par rapport aux données Chainlink. En lisant Chainlink directement, on peut anticiper le résultat du marché et placer des ordres avant que les prix ne s'ajustent.
+Polymarket utilise Chainlink Data Streams (pull-based, sub-seconde) pour résoudre ses marchés. Les market makers ajustent leurs quotes avec un léger retard. L'objectif est de détecter ce retard et placer des ordres avant correction.
 
-## Architecture
+## Architecture actuelle
 
 ```
 ┌──────────────┐     ┌──────────────────┐     ┌──────────────────┐
 │  Chainlink   │────▶│   Strategy       │────▶│   Polymarket     │
 │  (prix BTC)  │     │   (décision)     │     │   (ordres)       │
 │              │     │                  │     │                  │
-│ latestRound  │     │ compare prix     │     │ CLOB API         │
-│ Data() poll  │     │ calcule edge     │     │ place_order()    │
-│ toutes les   │     │ Kelly sizing     │     │ HMAC-SHA256 auth │
-│ 100ms        │     │ risk mgmt        │     │                  │
+│ latestRound  │     │ time-aware prob  │     │ CLOB API         │
+│ Data() via   │     │ half-Kelly size  │     │ EIP-712 signing  │
+│ alloy RPC    │     │ session limits   │     │ HMAC-SHA256 L2   │
+│ racing multi │     │                  │     │ FOK orders       │
 └──────────────┘     └──────────────────┘     └──────────────────┘
 ```
+
+## Stack technique
+
+- **Rust 2021 edition** avec `alloy` (pas ethers)
+- **alloy** : provider HTTP, sol! macro, EIP-712 signing, PrivateKeySigner
+- **reqwest** : HTTP client (Polymarket API)
+- **tokio** : async runtime multi-thread
+- **HMAC-SHA256 + base64** : auth Level 2 Polymarket
+- **Profil release** : LTO fat, codegen-units=1, panic=abort, strip
 
 ## Structure des fichiers
 
 ```
 poly5m/
-├── Cargo.toml         # Dépendances Rust
-├── config.toml        # Configuration (clés API, paramètres)
-├── CLAUDE.md          # Ce fichier
+├── Cargo.toml           # Dépendances (alloy, tokio, reqwest, hmac, etc.)
+├── config.toml          # Configuration runtime (NE PAS COMMIT — dans .gitignore)
+├── CLAUDE.md            # Ce fichier (contexte pour Claude)
+├── GUIDE.md             # Analyse détaillée de la chaîne de données et des edges
+├── TICKETS.md           # Plan d'amélioration + specs détaillées par ticket
 └── src/
-    ├── main.rs        # Point d'entrée, boucle principale
-    ├── chainlink.rs   # Client Chainlink (lecture prix oracle)
-    ├── polymarket.rs  # Client Polymarket CLOB (ordres, orderbook)
-    └── strategy.rs    # Logique de décision + risk management
+    ├── main.rs          # Entry point, boucle 5min, RPC racing, résolution
+    ├── chainlink.rs     # fetch_price() via alloy eth_call + ABI decode
+    ├── polymarket.rs    # Client CLOB: find market, midpoint, place_order (EIP-712)
+    └── strategy.rs      # evaluate(), prob model (CDF normale), half-Kelly, Session
 ```
 
-## Configuration requise
+## Concepts clés du code
 
-### Prérequis
+### RPC Racing (main.rs)
+`fetch_racing()` lance des appels simultanés vers tous les RPC providers et prend la première réponse. Utilise `futures::select_ok`.
 
-1. **Rust** : `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
-2. **Clé RPC Ethereum** : Alchemy, Infura ou QuickNode (plan gratuit OK)
-3. **Compte Polymarket** avec credentials API (voir section Auth ci-dessous)
-4. **USDC sur Polygon** : pour placer les trades
+### Modèle de probabilité time-aware (strategy.rs)
+```
+vol_résiduelle = 0.12% × √(seconds_remaining / 300)
+z = price_change_pct / vol_résiduelle
+probabilité_UP = CDF_normale(z)
+```
+Plus on approche de la fin de l'intervalle, plus la vol résiduelle est faible, plus le z-score est grand, plus on est confiant sur la direction.
 
-### Obtenir les credentials Polymarket
+### Sizing demi-Kelly (strategy.rs)
+```
+b = (1 - price) / price
+kelly = (b × p - q) / b
+size = (kelly / 2) × max_bet
+```
 
-1. Va sur [polymarket.com](https://polymarket.com) et connecte ton wallet
-2. L'API utilise un système d'auth à 2 niveaux :
-   - **Level 1** : Signe un message EIP-712 avec ta clé privée → obtient `api_key` + `api_secret` + `passphrase`
-   - **Level 2** : Chaque requête est signée en HMAC-SHA256
-3. Le bot gère le Level 2 automatiquement. Tu dois faire le Level 1 manuellement une fois.
-4. Docs : https://docs.polymarket.com/developers/CLOB/authentication
+### Auth Polymarket (polymarket.rs)
+- **EIP-712** : signe un struct `Order` avec le domain `Polymarket CTF Exchange` sur chain 137 (Polygon)
+- **HMAC-SHA256** : headers `POLY_SIGNATURE`, `POLY_TIMESTAMP`, `POLY_API_KEY`, `POLY_PASSPHRASE`, `POLY_ADDRESS`
+- **Ordres FOK** (Fill-Or-Kill) : soit l'ordre est entièrement exécuté, soit il est annulé
 
-### Remplir config.toml
+### Dry-run mode
+Si `strategy.dry_run = true` dans config.toml, le bot simule les trades sans appeler l'API Polymarket. Utile pour valider la logique.
+
+### Résolution des bets (main.rs)
+À chaque nouvel intervalle 5min, le bot compare le prix Chainlink actuel au `start_price` du bet précédent pour déterminer WIN/LOSS et calculer le PnL.
+
+## Config actuelle (config.toml)
 
 ```toml
 [chainlink]
-rpc_url = "https://eth-mainnet.g.alchemy.com/v2/TA_VRAIE_CLE"
+rpc_urls = ["url1", "url2", "url3"]  # Multi-RPC racing
 btc_usd_feed = "0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c"
 poll_interval_ms = 100
 
 [polymarket]
 api_key = "..."
-api_secret = "..."
+api_secret = "..."      # Base64 URL-safe encoded
 passphrase = "..."
-private_key = "0x..."
+private_key = "0x..."   # Clé privée Polygon wallet
 
 [strategy]
-max_bet_usdc = 2.0       # $2 max par trade
-min_edge_pct = 2.0        # 2% d'edge minimum pour trader
-entry_seconds_before_end = 10  # Trade dans les 10 dernières secondes
+max_bet_usdc = 2.0
+min_edge_pct = 2.0
+entry_seconds_before_end = 10
 session_profit_target_usdc = 20.0
 session_loss_limit_usdc = 10.0
+dry_run = false
 ```
 
-## Lancer le bot
+## Ce que le bot fait actuellement
 
-```bash
-# Build optimisé (LTO + strip, ~30s la première fois)
-cargo build --release
+1. Poll Chainlink `latestRoundData()` toutes les 100ms via RPC racing
+2. Détecte les intervalles 5min (window = timestamp / 300 × 300)
+3. Enregistre le prix de début d'intervalle
+4. Dans les 10 dernières secondes, fetch le midpoint Polymarket et évalue le signal
+5. Si edge > min_edge_pct → place un ordre FOK (ou simule en dry-run)
+6. Résout le bet précédent au début de l'intervalle suivant
 
-# Lancer
-./target/release/poly5m
+## Limitations connues (à corriger — voir TICKETS.md)
 
-# Ou en mode debug avec plus de logs
-RUST_LOG=debug cargo run
+1. **Pas de frais dynamiques** : le bot ne tient pas compte des taker fees Polymarket (jusqu'à 3.15% à 50/50). Il trade potentiellement à perte.
+2. **Source de prix sous-optimale** : `latestRoundData()` on-chain a un heartbeat d'~1h pour BTC/USD. Polymarket utilise Data Streams (sub-seconde), pas ce contrat.
+3. **Pas de filtre zone 50/50** : le bot peut trader quand les frais sont maximaux.
+4. **Vol statique** : la vol 5min est hardcodée à 0.12% au lieu d'être calculée dynamiquement.
+5. **Pas de logging CSV** : impossible de backtester sans données historiques.
+
+## Améliorations planifiées (TICKETS.md)
+
+Les tickets sont ordonnés par priorité et dépendances. Chaque ticket a des specs précises avec les fichiers à modifier, le code à ajouter, et les tests attendus.
+
+| Ticket | Description | Fichiers |
+|--------|-------------|----------|
+| T1 | Frais dynamiques dans evaluate() | strategy.rs, config.toml |
+| T2 | Query fee-rate API avant chaque trade | polymarket.rs, main.rs |
+| T3 | Filtre zone de prix (éviter 50/50) | strategy.rs, config.toml |
+| T4 | WebSocket exchanges (Binance+Coinbase+Kraken) | exchanges.rs (NOUVEAU), Cargo.toml |
+| T5 | Médiane multi-exchange dans evaluate() | main.rs, strategy.rs |
+| T6 | Volatilité dynamique (VolTracker) | strategy.rs, main.rs, config.toml |
+| T7 | Mode mixte Chainlink + exchanges WS | strategy.rs, main.rs, config.toml |
+| T8 | Logging CSV pour backtesting | logger.rs (NOUVEAU), main.rs |
+
+**Ordre d'exécution** : T1 → T3 → T2 → T4 → T5 → T6 → T7 → T8
+
+**Règle** : `cargo test` doit passer après chaque ticket.
+
+## Contexte marché important
+
+### Frais dynamiques Polymarket (janvier 2026)
 ```
+Fee = C × (feeRateBps / 10000) × [p × (1 - p)]^2
+```
+feeRateBps = 1000 pour les marchés crypto 5min/15min. À p=0.50 → ~3.15% de frais. À p=0.80 → ~1.28%. Makers = 0 frais + rebates.
 
-## Comment fonctionne la stratégie
+### Settlement
+Polymarket utilise Chainlink Data Streams (pas `latestRoundData()`). Le settlement compare `start_price` et `end_price` via Data Streams. En cas d'égalité, UP gagne (règle >=).
 
-### Cycle de trading (chaque intervalle de 5 min)
+### Gamma API slugs
+Format : `btc-updown-5m-{unix_timestamp_du_window}`
 
-1. **T=0** : Nouvel intervalle → enregistre le prix BTC via Chainlink
-2. **T=0 à T=4:50** : Polling continu de Chainlink (toutes les 100ms), calcul de la direction
-3. **T=4:50** : Fenêtre de trade ouverte (10s avant la fin)
-4. **Évaluation** :
-   - Compare le prix Chainlink actuel vs prix de début
-   - Si BTC monte et le marché price UP trop bas → BUY UP
-   - Si BTC descend et le marché price DOWN trop bas → BUY DOWN
-   - Si l'edge est < 2% → pas de trade
-5. **Sizing** : Demi-Kelly Criterion (conservateur)
-6. **Exécution** : Place l'ordre via CLOB API
+### Contrats
+- CTF Exchange : `0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E` (Polygon)
+- Chainlink BTC/USD (on-chain, PAS utilisé pour settlement) : `0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c`
 
-### Paramètres clés à ajuster
+## Conventions de code
 
-| Paramètre | Impact | Recommandation |
-|---|---|---|
-| `min_edge_pct` | Plus haut = moins de trades mais plus sûrs | Commence à 3%, baisse à 2% si trop peu de trades |
-| `entry_seconds_before_end` | Plus tard = plus de certitude mais risque de miss | 10s est un bon compromis |
-| `max_bet_usdc` | Risk par trade | $1-3 pour commencer |
-| `poll_interval_ms` | Fréquence de lecture Chainlink | 100ms (ne pas descendre en dessous, rate limit RPC) |
-
-## Améliorations possibles
-
-### Priorité haute
-
-- [ ] **WebSocket Chainlink** : Remplacer le polling HTTP par une souscription WebSocket pour une latence encore plus basse
-- [ ] **Gestion des résultats** : Actuellement le bot ne vérifie pas automatiquement si le trade a gagné ou perdu. Ajouter un listener sur les événements de settlement
-- [ ] **Retry logic** : Ajouter des retries exponentiels sur les appels API en cas d'erreur réseau
-
-### Priorité moyenne
-
-- [ ] **Multi-market** : Supporter ETH et d'autres assets en parallèle
-- [ ] **Backtesting** : Logger les données historiques de Chainlink vs Polymarket pour valider la stratégie
-- [ ] **Dashboard** : Petit serveur web local pour visualiser les trades en temps réel
-
-### Priorité basse
-
-- [ ] **Chainlink Data Streams** : Utiliser l'API Data Streams (sub-millisecond) au lieu de latestRoundData() pour un edge encore plus fin
-- [ ] **Colocation** : Déployer sur un serveur proche des nœuds Polygon/Ethereum pour réduire la latence réseau
-
-## Dépannage
-
-### "Aucun marché 5min BTC actif trouvé"
-Les marchés 5 minutes ne sont pas toujours actifs. Ils tournent typiquement pendant les heures de trading crypto à fort volume. Vérifie sur polymarket.com qu'il y a bien des marchés 5min ouverts.
-
-### "Edge insuffisant"
-Normal — la stratégie est conservatrice. Si tu ne vois jamais de trades, essaie de baisser `min_edge_pct` à 1.5%.
-
-### Erreurs d'authentification Polymarket
-Vérifie que tes credentials Level 1 sont valides. Ils expirent — tu dois les regénérer périodiquement.
-
-### Rate limiting RPC
-Si tu vois des erreurs 429, augmente `poll_interval_ms` à 200 ou 500. Ou utilise un plan RPC payant.
-
-## Sécurité
-
-⚠️ **Ne commit jamais config.toml** avec tes clés. Ajoute-le à `.gitignore`.
-⚠️ **Teste d'abord avec $0.10** par trade pour valider que tout fonctionne.
-⚠️ Ce bot trade avec de l'argent réel. Aucune garantie de profit.
+- Erreurs : `anyhow::Result` partout, `.context("message")` sur chaque `?`
+- Logging : `tracing` (info/warn/error/debug), pas println
+- Async : `tokio` multi-thread, pas de `.block_on()`
+- Serde : `#[serde(rename_all = "camelCase")]` pour les réponses API Polymarket
+- Tests : dans `#[cfg(test)] mod tests` en bas de chaque fichier
+- Config : `serde::Deserialize` depuis `config.toml`, converteurs `From<>` vers les structs internes
