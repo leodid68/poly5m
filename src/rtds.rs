@@ -87,13 +87,12 @@ async fn run_rtds(url: &str, symbol: &str, tx: &watch::Sender<Option<RtdsPrice>>
     tracing::info!("[RTDS] WS connected to {url}");
 
     // Subscribe to crypto_prices_chainlink for the symbol
-    let filters = serde_json::json!({"symbol": symbol}).to_string();
     let sub = serde_json::json!({
         "action": "subscribe",
         "subscriptions": [{
             "topic": "crypto_prices_chainlink",
             "type": "*",
-            "filters": filters
+            "filters": {"symbol": symbol}
         }]
     });
     ws.send(Message::Text(sub.to_string().into())).await?;
@@ -108,6 +107,10 @@ async fn run_rtds(url: &str, symbol: &str, tx: &watch::Sender<Option<RtdsPrice>>
                 match msg {
                     Some(Ok(Message::Text(ref text))) => {
                         if let Ok(m) = serde_json::from_str::<RtdsMsg>(text) {
+                            if m.msg_type.as_deref() == Some("subscribed") {
+                                tracing::info!("[RTDS] Subscription confirmed: {}",
+                                    m.topic.as_deref().unwrap_or("unknown"));
+                            }
                             if m.topic.as_deref() == Some("crypto_prices_chainlink")
                                 && m.msg_type.as_deref() == Some("update")
                             {
@@ -115,7 +118,7 @@ async fn run_rtds(url: &str, symbol: &str, tx: &watch::Sender<Option<RtdsPrice>>
                                     if p.symbol == symbol && p.value > 0.0 {
                                         let _ = tx.send(Some(RtdsPrice {
                                             price: p.value,
-                                            timestamp_ms: p.timestamp,
+                                            timestamp_ms: now_ms(),
                                         }));
                                     }
                                 }

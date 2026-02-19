@@ -409,11 +409,12 @@ async fn main() -> Result<()> {
             polymarket::BookData::default()
         };
 
-        // evaluate() : CL price for divergence check, WS price for probability model
+        // evaluate() : RTDS for probability model (settlement price), CL/WS for divergence
         let ctx = strategy::TradeContext {
             start_price,
             chainlink_price: cl_price.unwrap_or(current_btc),
             exchange_price: ws_price,
+            rtds_price,
             market_up_price,
             seconds_remaining: remaining,
             fee_rate: strat_config.fee_rate,

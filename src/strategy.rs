@@ -92,6 +92,7 @@ pub struct TradeContext {
     pub start_price: f64,
     pub chainlink_price: f64,
     pub exchange_price: Option<f64>,
+    pub rtds_price: Option<f64>,
     pub market_up_price: f64,
     pub seconds_remaining: u64,
     pub fee_rate: f64,
@@ -143,8 +144,10 @@ pub fn evaluate(
     }
 
     // 5. Direction et probabilité estimée (time-aware)
-    // Préfère le prix exchange (100-200ms plus frais) si disponible
-    let current_price = ctx.exchange_price.unwrap_or(ctx.chainlink_price);
+    // Priorité : RTDS (prix settlement) > exchange WS > Chainlink on-chain
+    let current_price = ctx.rtds_price
+        .or(ctx.exchange_price)
+        .unwrap_or(ctx.chainlink_price);
     let price_change_pct = (current_price - ctx.start_price) / ctx.start_price * 100.0;
     let true_up_prob = price_change_to_probability(price_change_pct, ctx.seconds_remaining, ctx.vol_5min_pct);
     let true_down_prob = 1.0 - true_up_prob;
@@ -198,7 +201,7 @@ pub fn evaluate(
         "SIGNAL: {} | Edge: {:.1}% (brut {:.1}%, fee {:.2}%) | Δ prix: {:.4}% | Size: ${:.2} | {}s restantes | src: {}",
         if side == Side::Buy { "BUY UP" } else { "BUY DOWN" },
         net_edge_pct, edge_pct, fee * 100.0, price_change_pct, size, ctx.seconds_remaining,
-        if ctx.exchange_price.is_some() { "WS" } else { "CL" },
+        if ctx.rtds_price.is_some() { "RTDS" } else if ctx.exchange_price.is_some() { "WS" } else { "CL" },
     );
 
     Some(Signal {
@@ -284,6 +287,7 @@ mod tests {
             start_price: 100_000.0,
             chainlink_price: 100_000.0,
             exchange_price: None,
+            rtds_price: None,
             market_up_price: 0.50,
             seconds_remaining: 10,
             fee_rate: 0.25,
@@ -752,6 +756,7 @@ mod tests {
             start_price: 100_000.0,
             chainlink_price: 100_030.0,
             exchange_price: Some(100_030.0),
+            rtds_price: None,
             market_up_price: 0.55,
             seconds_remaining: 20,
             fee_rate: 0.25,
@@ -776,6 +781,7 @@ mod tests {
             start_price: 100_000.0,
             chainlink_price: 100_005.0,
             exchange_price: Some(100_005.0),
+            rtds_price: None,
             market_up_price: 0.55,
             seconds_remaining: 20,
             fee_rate: 0.25,
@@ -795,6 +801,7 @@ mod tests {
             start_price: 100_000.0,
             chainlink_price: 100_050.0,
             exchange_price: Some(100_050.0),
+            rtds_price: None,
             market_up_price: 0.80,
             seconds_remaining: 15,
             fee_rate: 0.25,
@@ -818,6 +825,7 @@ mod tests {
             start_price: 100_000.0,
             chainlink_price: 100_050.0,
             exchange_price: Some(100_050.0),
+            rtds_price: None,
             market_up_price: 0.50,
             seconds_remaining: 15,
             fee_rate: 0.25,
@@ -837,6 +845,7 @@ mod tests {
             start_price: 100_000.0,
             chainlink_price: 100_010.0, // +0.01%
             exchange_price: Some(100_010.0),
+            rtds_price: None,
             market_up_price: 0.50,
             seconds_remaining: 20,
             fee_rate: 0.25,
