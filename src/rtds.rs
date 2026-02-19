@@ -78,6 +78,7 @@ struct RtdsMsg {
 #[derive(Deserialize)]
 struct RtdsPayload {
     symbol: String,
+    #[allow(dead_code)]
     timestamp: u64,
     value: f64,
 }

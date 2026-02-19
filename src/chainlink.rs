@@ -19,6 +19,7 @@ sol! {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct PriceData {
     pub price_usd: f64,
     pub round_id: u128,

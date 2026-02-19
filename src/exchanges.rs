@@ -8,6 +8,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 const STALE_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, Copy, Default)]
+#[allow(dead_code)]
 pub struct AggregatedPrice {
     pub median_price: f64,
     pub num_sources: u8,

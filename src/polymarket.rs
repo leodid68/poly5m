@@ -43,6 +43,7 @@ pub enum Side {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Market {
     pub condition_id: String,
     pub token_id_yes: String,
@@ -114,6 +115,7 @@ struct BookLevel {
 
 /// Données du carnet d'ordres agrégées.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct BookData {
     pub best_bid: f64,
     pub best_ask: f64,
