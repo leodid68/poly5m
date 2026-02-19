@@ -216,10 +216,12 @@ impl PolymarketClient {
         }
         let book: BookResponse = resp.json().await?;
 
-        let best_bid = book.bids.first()
-            .and_then(|l| l.price.parse::<f64>().ok()).unwrap_or(0.0);
-        let best_ask = book.asks.first()
-            .and_then(|l| l.price.parse::<f64>().ok()).unwrap_or(1.0);
+        let best_bid = book.bids.iter()
+            .filter_map(|l| l.price.parse::<f64>().ok())
+            .fold(0.0_f64, f64::max);
+        let best_ask = book.asks.iter()
+            .filter_map(|l| l.price.parse::<f64>().ok())
+            .fold(1.0_f64, f64::min);
 
         let bid_depth: f64 = book.bids.iter()
             .filter_map(|l| {
