@@ -120,6 +120,8 @@ struct StrategyToml {
     kelly_fraction: f64,
     #[serde(default = "default_initial_bankroll")]
     initial_bankroll_usdc: f64,
+    #[serde(default)]
+    always_trade: bool,
 }
 
 fn default_min_bet_usdc() -> f64 { 1.0 }
@@ -153,6 +155,7 @@ impl From<StrategyToml> for strategy::StrategyConfig {
             max_spread: s.max_spread,
             kelly_fraction: s.kelly_fraction,
             initial_bankroll_usdc: s.initial_bankroll_usdc,
+            always_trade: s.always_trade,
         }
     }
 }

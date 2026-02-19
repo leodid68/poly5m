@@ -18,6 +18,7 @@ pub struct StrategyConfig {
     pub max_spread: f64,
     pub kelly_fraction: f64,
     pub initial_bankroll_usdc: f64,
+    pub always_trade: bool,
 }
 
 /// Signal de trade émis par la stratégie.
@@ -139,16 +140,64 @@ pub fn evaluate(
         return None;
     }
 
-    // 3. Validation inputs + filtre zone de prix
+    // 3. Validation inputs
     if ctx.start_price <= 0.0 || !(0.01..=0.99).contains(&ctx.market_up_price) {
         return None;
     }
+
+    // 4. Direction et probabilité estimée (time-aware)
+    // Priorité : RTDS (prix settlement) > exchange WS > Chainlink on-chain
+    let current_price = ctx.rtds_price
+        .or(ctx.exchange_price)
+        .unwrap_or(ctx.chainlink_price);
+    let price_change_pct = (current_price - ctx.start_price) / ctx.start_price * 100.0;
+
+    let true_up_prob = price_change_to_probability(price_change_pct, ctx.seconds_remaining, ctx.vol_5min_pct);
+    let true_down_prob = 1.0 - true_up_prob;
+    let market_down_price = 1.0 - ctx.market_up_price;
+
+    // 5. Edge calculation
+    let edge_up = true_up_prob - ctx.market_up_price;
+    let edge_down = true_down_prob - market_down_price;
+
+    let (side, edge, market_price, true_prob) = if edge_up >= edge_down {
+        (Side::Buy, edge_up, ctx.market_up_price, true_up_prob)
+    } else {
+        (Side::Sell, edge_down, market_down_price, true_down_prob)
+    };
+
+    let edge_pct = edge * 100.0;
+    let fee = dynamic_fee(market_price, ctx.fee_rate);
+    let spread_cost = ctx.spread / 2.0;
+    let net_edge_pct = edge_pct - (fee * 100.0) - (spread_cost * 100.0);
+
+    // 6. always_trade: bypass filters, trade at min_bet in best direction
+    if config.always_trade {
+        let min_usdc = (config.min_shares as f64 * market_price).max(config.min_bet_usdc);
+        let size = min_usdc.min(config.max_bet_usdc);
+        tracing::info!(
+            "SIGNAL [ALWAYS]: {} | Edge: {:.1}% (brut {:.1}%, fee {:.2}%) | Δ prix: {:.4}% | Size: ${:.2} | {}s restantes | src: {}",
+            if side == Side::Buy { "BUY UP" } else { "BUY DOWN" },
+            net_edge_pct, edge_pct, fee * 100.0, price_change_pct, size, ctx.seconds_remaining,
+            if ctx.rtds_price.is_some() { "RTDS" } else if ctx.exchange_price.is_some() { "WS" } else { "CL" },
+        );
+        return Some(Signal {
+            side,
+            edge_pct: net_edge_pct,
+            edge_brut_pct: edge_pct,
+            fee_pct: fee * 100.0,
+            implied_p_up: true_up_prob,
+            size_usdc: size,
+            price: market_price,
+        });
+    }
+
+    // 7. Normal mode: apply all filters
     if ctx.market_up_price < config.min_market_price || ctx.market_up_price > config.max_market_price {
         return None;
     }
 
-    // 4. Cohérence Chainlink / exchanges — skip si divergence directionnelle
-    //    Tolérance : si Chainlink est quasi-flat (<0.001%), on fait confiance aux exchanges
+    // Cohérence Chainlink / exchanges — skip si divergence directionnelle
     if let Some(ex_price) = ctx.exchange_price {
         let cl_move_pct = ((ctx.chainlink_price - ctx.start_price) / ctx.start_price).abs();
         if cl_move_pct > 0.00001 {
@@ -162,51 +211,21 @@ pub fn evaluate(
         }
     }
 
-    // 5. Direction et probabilité estimée (time-aware)
-    // Priorité : RTDS (prix settlement) > exchange WS > Chainlink on-chain
-    let current_price = ctx.rtds_price
-        .or(ctx.exchange_price)
-        .unwrap_or(ctx.chainlink_price);
-    let price_change_pct = (current_price - ctx.start_price) / ctx.start_price * 100.0;
-
-    // 5a. Filtre Δ% minimum — quand le prix n'a pas bougé, le marché a meilleure info
     if price_change_pct.abs() < config.min_delta_pct {
         tracing::debug!("Skip: Δ {:.4}% < min_delta {:.4}%", price_change_pct.abs(), config.min_delta_pct);
         return None;
     }
 
-    // 5b. Filtre spread — skip si le book est trop large
     if config.max_spread > 0.0 && ctx.spread > config.max_spread {
         tracing::debug!("Skip: spread {:.4} > max {:.4}", ctx.spread, config.max_spread);
         return None;
     }
 
-    let true_up_prob = price_change_to_probability(price_change_pct, ctx.seconds_remaining, ctx.vol_5min_pct);
-    let true_down_prob = 1.0 - true_up_prob;
-    let market_down_price = 1.0 - ctx.market_up_price;
-
-    // 6. Edge — edge_up = -edge_down toujours, on check juste le signe
-    let edge_up = true_up_prob - ctx.market_up_price;
-    let edge_down = true_down_prob - market_down_price;
-
-    let (side, edge, market_price, true_prob) = if edge_up > 0.0 {
-        (Side::Buy, edge_up, ctx.market_up_price, true_up_prob)
-    } else if edge_down > 0.0 {
-        (Side::Sell, edge_down, market_down_price, true_down_prob)
-    } else {
-        return None;
-    };
-
-    let edge_pct = edge * 100.0;
-    let fee = dynamic_fee(market_price, ctx.fee_rate);
-    let spread_cost = ctx.spread / 2.0; // taker pays half the spread
-    let net_edge_pct = edge_pct - (fee * 100.0) - (spread_cost * 100.0);
-
-    if net_edge_pct < config.min_edge_pct {
+    if edge <= 0.0 || net_edge_pct < config.min_edge_pct {
         return None;
     }
 
-    // 7. Fractional Kelly sizing with fee-adjusted payout and bankroll tracking
+    // 8. Fractional Kelly sizing with fee-adjusted payout and bankroll tracking
     let bankroll = session.bankroll();
     let kelly_size = fractional_kelly(
         true_prob, market_price, ctx.fee_rate,
@@ -215,13 +234,11 @@ pub fn evaluate(
     if kelly_size <= 0.0 {
         return None;
     }
-    // Polymarket CLOB minimum: min_shares × price, and absolute floor min_bet_usdc
     let min_usdc = (config.min_shares as f64 * market_price).max(config.min_bet_usdc);
     if min_usdc > config.max_bet_usdc {
         tracing::debug!("Skip: min order ${:.2} > max_bet ${:.2}", min_usdc, config.max_bet_usdc);
         return None;
     }
-    // Guard: if Kelly recommends <10% of minimum, edge is too marginal to bump
     if kelly_size < min_usdc * 0.1 {
         tracing::debug!("Skip: Kelly ${:.2} too marginal vs min ${:.2}", kelly_size, min_usdc);
         return None;
@@ -322,6 +339,7 @@ mod tests {
             max_spread: 0.0,
             kelly_fraction: 0.5,
             initial_bankroll_usdc: 40.0,
+            always_trade: false,
         }
     }
 
@@ -906,6 +924,7 @@ mod tests {
             max_spread: 0.05,
             kelly_fraction: 0.25,
             initial_bankroll_usdc: 40.0,
+            always_trade: false,
         }
     }
 
