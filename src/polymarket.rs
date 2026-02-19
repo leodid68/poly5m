@@ -286,6 +286,26 @@ impl PolymarketClient {
         self.build_and_send_order(token_id, side, size_usdc, price, fee_rate_bps, "GTC").await
     }
 
+    /// Check the status of an order.
+    pub async fn get_order_status(&self, order_id: &str) -> Result<String> {
+        let path = format!("/order/{order_id}");
+        let headers = self.sign_hmac("GET", &path, "")?;
+
+        let mut req = self.http.get(format!("{CLOB_BASE}{path}"));
+        for (k, v) in &headers {
+            req = req.header(k, v);
+        }
+
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Order status API error ({status}): {body}");
+        }
+        let result: OrderResponse = resp.json().await?;
+        Ok(result.status)
+    }
+
     /// Cancel an open order.
     pub async fn cancel_order(&self, order_id: &str) -> Result<()> {
         let body = serde_json::json!({ "orderID": order_id });

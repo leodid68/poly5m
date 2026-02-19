@@ -402,8 +402,10 @@ async fn main() -> Result<()> {
             None => (&dummy_token, "YES"),
         };
 
-        // Fetch book for the ACTUAL token to get correct best_ask
-        let book = if let Some(ref poly) = poly {
+        // Reuse spread_book if trading YES token, otherwise fetch NO token book
+        let book = if signal.side == polymarket::Side::Buy {
+            spread_book.clone() // YES token — already fetched for spread
+        } else if let Some(ref poly) = poly {
             poly.get_book(token_id).await.unwrap_or_default()
         } else {
             polymarket::BookData::default()
@@ -455,14 +457,27 @@ async fn main() -> Result<()> {
                             // Immediately filled (crossed the book)
                             Some(result)
                         } else {
-                            // Wait for fill
+                            // Wait for fill, then check status
                             tokio::time::sleep(Duration::from_secs(maker_timeout_s)).await;
-                            // TODO: Check order status via API — for now, cancel after timeout
-                            tracing::info!("[MAKER] Timeout {}s — cancelling {}", maker_timeout_s, result.order_id);
-                            if let Err(e) = poly.cancel_order(&result.order_id).await {
-                                tracing::warn!("[MAKER] Cancel failed: {e:#}");
+                            let filled = match poly.get_order_status(&result.order_id).await {
+                                Ok(status) => {
+                                    tracing::info!("[MAKER] Order {} status after {}s: {}", result.order_id, maker_timeout_s, status);
+                                    status == "matched"
+                                }
+                                Err(e) => {
+                                    tracing::warn!("[MAKER] Status check failed: {e:#}");
+                                    false
+                                }
+                            };
+                            if filled {
+                                Some(result)
+                            } else {
+                                tracing::info!("[MAKER] Not filled — cancelling {}", result.order_id);
+                                if let Err(e) = poly.cancel_order(&result.order_id).await {
+                                    tracing::warn!("[MAKER] Cancel failed: {e:#}");
+                                }
+                                None
                             }
-                            None // Order not filled
                         }
                     }
                     Err(e) => {
