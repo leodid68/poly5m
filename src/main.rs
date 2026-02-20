@@ -413,7 +413,7 @@ async fn main() -> Result<()> {
             }
         };
 
-        window_ticks.tick(current_btc);
+        window_ticks.tick(current_btc, now * 1000);
 
         // Nouvel intervalle 5min — résoudre le bet précédent
         if window != current_window {

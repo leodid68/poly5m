@@ -199,19 +199,25 @@ impl VolTracker {
 #[derive(Debug)]
 pub struct WindowTicks {
     prices: Vec<f64>,
+    timestamps_ms: Vec<u64>,
 }
 
 impl WindowTicks {
     pub fn new() -> Self {
-        Self { prices: Vec::with_capacity(3200) }
+        Self {
+            prices: Vec::with_capacity(3200),
+            timestamps_ms: Vec::with_capacity(3200),
+        }
     }
 
-    pub fn tick(&mut self, price: f64) {
+    pub fn tick(&mut self, price: f64, timestamp_ms: u64) {
         self.prices.push(price);
+        self.timestamps_ms.push(timestamp_ms);
     }
 
     pub fn clear(&mut self) {
         self.prices.clear();
+        self.timestamps_ms.clear();
     }
 
     /// Micro-volatility: std dev of tick-to-tick log-returns (%).
@@ -243,6 +249,51 @@ impl WindowTicks {
             return 1.0;
         }
         up.max(down) as f64 / total as f64
+    }
+
+    pub fn ticks_count(&self) -> u32 {
+        self.prices.len() as u32
+    }
+
+    /// Number of sign changes in consecutive tick deltas.
+    pub fn sign_changes(&self) -> u32 {
+        if self.prices.len() < 3 { return 0; }
+        let mut changes = 0u32;
+        let mut prev_sign = 0i8;
+        for w in self.prices.windows(2) {
+            let delta = w[1] - w[0];
+            let sign = if delta > 0.0 { 1i8 } else if delta < 0.0 { -1i8 } else { 0i8 };
+            if sign != 0 {
+                if prev_sign != 0 && sign != prev_sign { changes += 1; }
+                prev_sign = sign;
+            }
+        }
+        changes
+    }
+
+    /// Worst intra-window drawdown from peak, in basis points.
+    pub fn max_drawdown_bps(&self) -> f64 {
+        if self.prices.len() < 2 { return 0.0; }
+        let mut peak = self.prices[0];
+        let mut max_dd = 0.0f64;
+        for &p in &self.prices[1..] {
+            if p > peak { peak = p; }
+            let dd = (peak - p) / peak * 10000.0;
+            if dd > max_dd { max_dd = dd; }
+        }
+        max_dd
+    }
+
+    /// Seconds the price spent above start_price.
+    pub fn time_at_extreme_s(&self, start_price: f64) -> u64 {
+        if self.timestamps_ms.len() < 2 { return 0; }
+        let mut above_ms = 0u64;
+        for i in 1..self.timestamps_ms.len() {
+            if self.prices[i] >= start_price {
+                above_ms += self.timestamps_ms[i].saturating_sub(self.timestamps_ms[i - 1]);
+            }
+        }
+        above_ms / 1000
     }
 }
 
@@ -1809,7 +1860,7 @@ mod tests {
     fn window_ticks_micro_vol_directional() {
         let mut wt = WindowTicks::new();
         for i in 0..5 {
-            wt.tick(100.0 + i as f64);
+            wt.tick(100.0 + i as f64, i as u64 * 100);
         }
         let mv = wt.micro_vol();
         assert!(mv > 0.0, "micro_vol should be positive: {mv}");
@@ -1820,10 +1871,10 @@ mod tests {
         let mut dir = WindowTicks::new();
         let mut chop = WindowTicks::new();
         for i in 0..20 {
-            dir.tick(100.0 + i as f64 * 0.5);
+            dir.tick(100.0 + i as f64 * 0.5, i as u64 * 100);
         }
         for i in 0..20 {
-            chop.tick(if i % 2 == 0 { 100.0 } else { 101.0 });
+            chop.tick(if i % 2 == 0 { 100.0 } else { 101.0 }, i as u64 * 100);
         }
         assert!(chop.micro_vol() > dir.micro_vol(),
             "choppy should have higher micro_vol: {} vs {}", chop.micro_vol(), dir.micro_vol());
@@ -1833,7 +1884,7 @@ mod tests {
     fn window_ticks_momentum_ratio_directional() {
         let mut wt = WindowTicks::new();
         for i in 0..10 {
-            wt.tick(100.0 + i as f64);
+            wt.tick(100.0 + i as f64, i as u64 * 100);
         }
         let mr = wt.momentum_ratio();
         assert!(mr > 0.8, "directional should have high momentum: {mr}");
@@ -1843,7 +1894,7 @@ mod tests {
     fn window_ticks_momentum_ratio_choppy() {
         let mut wt = WindowTicks::new();
         for i in 0..10 {
-            wt.tick(if i % 2 == 0 { 100.0 } else { 101.0 });
+            wt.tick(if i % 2 == 0 { 100.0 } else { 101.0 }, i as u64 * 100);
         }
         let mr = wt.momentum_ratio();
         assert!(mr < 0.6, "choppy should have low momentum: {mr}");
@@ -1859,9 +1910,47 @@ mod tests {
     #[test]
     fn window_ticks_single_price_defaults() {
         let mut wt = WindowTicks::new();
-        wt.tick(100.0);
+        wt.tick(100.0, 0);
         assert!(wt.micro_vol() == 0.0);
         assert!(wt.momentum_ratio() == 1.0);
+    }
+
+    #[test]
+    fn window_ticks_sign_changes() {
+        let mut wt = WindowTicks::new();
+        for (i, &p) in [100.0, 101.0, 102.0, 101.0, 100.0, 101.0].iter().enumerate() {
+            wt.tick(p, i as u64 * 100);
+        }
+        assert_eq!(wt.sign_changes(), 2);
+    }
+
+    #[test]
+    fn window_ticks_max_drawdown_bps() {
+        let mut wt = WindowTicks::new();
+        for (i, &p) in [100.0, 100.10, 100.05, 99.90, 100.0].iter().enumerate() {
+            wt.tick(p, i as u64 * 100);
+        }
+        let dd = wt.max_drawdown_bps();
+        assert!(dd > 19.0 && dd < 21.0, "drawdown should be ~20 bps: {dd}");
+    }
+
+    #[test]
+    fn window_ticks_time_at_extreme() {
+        let mut wt = WindowTicks::new();
+        wt.tick(100.0, 0);
+        wt.tick(100.5, 1000);
+        wt.tick(100.3, 2000);
+        wt.tick(99.8, 3000);
+        assert_eq!(wt.time_at_extreme_s(100.0), 2);
+    }
+
+    #[test]
+    fn window_ticks_ticks_count() {
+        let mut wt = WindowTicks::new();
+        wt.tick(100.0, 0);
+        wt.tick(101.0, 100);
+        wt.tick(102.0, 200);
+        assert_eq!(wt.ticks_count(), 3);
     }
 
     // --- Calibrator ---
