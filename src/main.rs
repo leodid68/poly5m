@@ -543,11 +543,20 @@ async fn main() -> Result<()> {
             polymarket::BookData::default()
         };
 
-        // Use best_ask as entry price (what taker actually pays), fallback to midpoint
-        let entry_price = if book.best_ask > 0.0 && book.best_ask <= 1.0 {
+        // Maker pricing for GTC: bid + 25% of spread (better than best_ask)
+        // Taker (FOK): use best_ask as usual
+        let entry_price = if order_type == "GTC" && book.best_bid > 0.0 && book.best_ask > 0.0 {
+            let spread = book.best_ask - book.best_bid;
+            if spread >= 0.02 {
+                let maker_price = book.best_bid + spread * 0.25;
+                (maker_price * 100.0).round() / 100.0
+            } else {
+                (book.best_bid + 0.01).min(book.best_ask)
+            }
+        } else if book.best_ask > 0.0 && book.best_ask <= 1.0 {
             book.best_ask
         } else {
-            signal.price // fallback to midpoint
+            signal.price
         };
 
         let side_label = if signal.side == polymarket::Side::Buy { "BUY_UP" } else { "BUY_DOWN" };
