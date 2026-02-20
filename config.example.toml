@@ -15,33 +15,54 @@ passphrase = "YOUR_PASSPHRASE"
 private_key = "0xYOUR_PRIVATE_KEY"
 
 [strategy]
-max_bet_usdc = 10.0
-min_bet_usdc = 1.0
-min_shares = 5
-min_edge_pct = 1.0
-entry_seconds_before_end = 30
-min_delta_pct = 0.005
-max_spread = 0.03
-session_profit_target_usdc = 500.0
-session_loss_limit_usdc = 500.0
-fee_rate = 0.25
-fee_rate_bps = 1000
-min_market_price = 0.05
-max_market_price = 0.95
-dry_run = true
-always_trade = false
-kelly_fraction = 0.25
-initial_bankroll_usdc = 100.0
-vol_lookback_intervals = 20
-default_vol_pct = 0.10
-vol_confidence_multiplier = 2.5
-min_payout_ratio = 0.08
-min_book_imbalance = 0.08
-max_vol_5min_pct = 0.12
-min_ws_sources = 3
-circuit_breaker_window = 15
-circuit_breaker_min_wr = 0.25
-circuit_breaker_cooldown_s = 1800
+# -- Sizing --
+max_bet_usdc = 3.0                # Maximum bet per trade (USD)
+min_bet_usdc = 1.0                # Minimum bet per trade (USD)
+min_shares = 5                    # Minimum shares per order (Polymarket constraint)
+kelly_fraction = 0.10             # Fraction of Kelly criterion (conservative: 10%)
+initial_bankroll_usdc = 40.0      # Starting bankroll for Kelly sizing
+
+# -- Signal quality --
+min_edge_pct = 3.0                # Minimum net edge after fees/spread (%)
+min_delta_pct = 0.008             # Minimum BTC price change to consider trading (%)
+min_implied_prob = 0.75           # Minimum model confidence to trade (0.75 = 75%+)
+vol_confidence_multiplier = 4.0   # Multiplier on residual vol (higher = more conservative)
+
+# -- Market filters --
+min_market_price = 0.25           # Skip markets below this price (avoid 50/50 zone fees)
+max_market_price = 0.75           # Skip markets above this price (avoid low-payout traps)
+max_spread = 0.04                 # Maximum bid-ask spread allowed
+min_book_imbalance = 0.08         # Minimum order book imbalance (data: <8% = low WR)
+min_payout_ratio = 0.08           # Minimum payout ratio to avoid low-return trades
+
+# -- Timing --
+entry_seconds_before_end = 8      # Enter in last N seconds of 5min window
+
+# -- Session limits --
+session_profit_target_usdc = 15.0 # Take profit and stop
+session_loss_limit_usdc = 10.0    # Stop loss for session (25% of $40 bankroll)
+
+# -- Fees --
+fee_rate = 0.25                   # Polymarket fee rate parameter
+fee_rate_bps = 1000               # Fee rate in basis points (API parameter)
+
+# -- Volatility --
+vol_lookback_intervals = 20       # Number of 5min intervals for vol calculation
+default_vol_pct = 0.10            # Default vol before enough data collected
+max_vol_5min_pct = 0.08           # Skip windows with vol > 8bp (unpredictable)
+
+# -- Data sources --
+min_ws_sources = 2                # Minimum WebSocket exchange feeds required
+
+# -- Circuit breaker --
+circuit_breaker_window = 10       # Rolling window of trades for WR check
+circuit_breaker_min_wr = 0.25     # Minimum win rate before circuit breaker triggers
+circuit_breaker_cooldown_s = 900  # Cooldown period after circuit breaker (15 min)
+max_consecutive_losses = 6        # Pause after N consecutive losses
+
+# -- Mode --
+dry_run = true                    # Set false for live trading
+always_trade = false              # Bypass filters (testing only)
 
 [rtds]
 enabled = true

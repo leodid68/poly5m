@@ -149,16 +149,16 @@ fn default_min_bet_usdc() -> f64 { 1.0 }
 fn default_min_shares() -> u64 { 5 }
 fn default_fee_rate() -> f64 { 0.25 }
 fn default_fee_rate_bps() -> u32 { 1000 }
-fn default_min_market_price() -> f64 { 0.15 }
-fn default_max_market_price() -> f64 { 0.85 }
+fn default_min_market_price() -> f64 { 0.25 }
+fn default_max_market_price() -> f64 { 0.75 }
 fn default_vol_lookback() -> usize { 20 }
 fn default_vol_pct() -> f64 { 0.12 }
 fn default_order_type() -> String { "FOK".into() }
 fn default_maker_timeout() -> u64 { 5 }
 fn default_max_spread() -> f64 { 0.0 }
-fn default_kelly_fraction() -> f64 { 0.25 }
+fn default_kelly_fraction() -> f64 { 0.10 }
 fn default_initial_bankroll() -> f64 { 40.0 }
-fn default_vol_confidence_multiplier() -> f64 { 1.0 }
+fn default_vol_confidence_multiplier() -> f64 { 4.0 }
 fn default_circuit_breaker_window() -> usize { 0 }
 fn default_circuit_breaker_cooldown() -> u64 { 1800 }
 

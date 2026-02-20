@@ -1037,64 +1037,64 @@ mod tests {
 
     fn prod_config() -> StrategyConfig {
         StrategyConfig {
-            max_bet_usdc: 5.0,
+            max_bet_usdc: 3.0,
             min_bet_usdc: 1.0,
             min_shares: 5,
-            min_edge_pct: 5.0,
-            entry_seconds_before_end: 12,
-            session_profit_target_usdc: 50.0,
-            session_loss_limit_usdc: 20.0,
+            min_edge_pct: 3.0,
+            entry_seconds_before_end: 8,
+            session_profit_target_usdc: 15.0,
+            session_loss_limit_usdc: 10.0,
             fee_rate: 0.25,
-            min_market_price: 0.20,
-            max_market_price: 0.80,
-            min_delta_pct: 0.005,
-            max_spread: 0.05,
-            kelly_fraction: 0.25,
+            min_market_price: 0.25,
+            max_market_price: 0.75,
+            min_delta_pct: 0.008,
+            max_spread: 0.04,
+            kelly_fraction: 0.10,
             initial_bankroll_usdc: 40.0,
             always_trade: false,
-            vol_confidence_multiplier: 2.5,
+            vol_confidence_multiplier: 4.0,
             min_payout_ratio: 0.08,
-            min_book_imbalance: 0.05,  // Data: <5% imbalance = 2-13% WR
-            max_vol_5min_pct: 0.10,    // Data: only <10bp vol is profitable
-            min_ws_sources: 3,
-            circuit_breaker_window: 15,
+            min_book_imbalance: 0.08,  // Data: <8% imbalance = low WR
+            max_vol_5min_pct: 0.08,    // Data: only <8bp vol is profitable
+            min_ws_sources: 2,
+            circuit_breaker_window: 10,
             circuit_breaker_min_wr: 0.25,
-            circuit_breaker_cooldown_s: 1800,
-            min_implied_prob: 0.70,    // Data: low-confidence trades lose
-            max_consecutive_losses: 8, // Data: max loss streak was 13
+            circuit_breaker_cooldown_s: 900,
+            min_implied_prob: 0.75,    // Data: low-confidence trades lose
+            max_consecutive_losses: 6, // Data: cap exposure during drawdowns
         }
     }
 
     #[test]
     fn paper_strong_up_signal_10s() {
-        // BTC +0.03% with 10s remaining, market at 0.55, spread 0.02
+        // BTC +0.05% with 8s remaining, market at 0.55, spread 0.02
         let config = prod_config();
         let session = Session::new(40.0);
         let ctx = TradeContext {
             start_price: 100_000.0,
-            chainlink_price: 100_030.0,
-            exchange_price: Some(100_030.0),
+            chainlink_price: 100_050.0,
+            exchange_price: Some(100_050.0),
             rtds_price: None,
             market_up_price: 0.55,
-            seconds_remaining: 10,
+            seconds_remaining: 8,
             fee_rate: 0.25,
-            vol_5min_pct: 0.10,
+            vol_5min_pct: 0.06,
             spread: 0.02,
             book_imbalance: 0.20,
             num_ws_sources: 3,
         };
         let signal = evaluate(&ctx, &session, &config);
-        assert!(signal.is_some(), "should trade with +0.03% at 10s");
+        assert!(signal.is_some(), "should trade with +0.05% at 8s");
         let s = signal.unwrap();
         assert_eq!(s.side, Side::Buy);
-        assert!(s.size_usdc >= 1.0 && s.size_usdc <= 5.0,
-            "size ${:.2} should be in $1-$5 range", s.size_usdc);
-        assert!(s.edge_pct >= 5.0, "net edge {:.1}% should be >= 5%", s.edge_pct);
+        assert!(s.size_usdc >= 1.0 && s.size_usdc <= 3.0,
+            "size ${:.2} should be in $1-$3 range", s.size_usdc);
+        assert!(s.edge_pct >= 3.0, "net edge {:.1}% should be >= 3%", s.edge_pct);
     }
 
     #[test]
     fn paper_weak_signal_rejected() {
-        // BTC +0.005% with 10s remaining → small edge, below min_edge 5%
+        // BTC +0.005% with 8s remaining → small edge, below min_edge 3%
         let config = prod_config();
         let session = Session::new(40.0);
         let ctx = TradeContext {
@@ -1103,20 +1103,20 @@ mod tests {
             exchange_price: Some(100_005.0),
             rtds_price: None,
             market_up_price: 0.55,
-            seconds_remaining: 10,
+            seconds_remaining: 8,
             fee_rate: 0.25,
-            vol_5min_pct: 0.10,
+            vol_5min_pct: 0.06,
             spread: 0.02,
             book_imbalance: 0.20,
             num_ws_sources: 3,
         };
         let signal = evaluate(&ctx, &session, &config);
-        assert!(signal.is_none(), "weak +0.005% should not pass 5% min edge");
+        assert!(signal.is_none(), "weak +0.005% should not pass 3% min edge");
     }
 
     #[test]
     fn paper_high_price_min_shares_binding() {
-        // Market at 0.80 → 5 shares = $4.00 min, close to max_bet $5
+        // Market at 0.60 → 5 shares = $3.00 min, equal to max_bet $3
         let config = prod_config();
         let session = Session::new(40.0);
         let ctx = TradeContext {
@@ -1124,65 +1124,65 @@ mod tests {
             chainlink_price: 100_050.0,
             exchange_price: Some(100_050.0),
             rtds_price: None,
-            market_up_price: 0.80,
-            seconds_remaining: 10,
+            market_up_price: 0.60,
+            seconds_remaining: 8,
             fee_rate: 0.25,
-            vol_5min_pct: 0.10,
+            vol_5min_pct: 0.06,
             spread: 0.01,
             book_imbalance: 0.20,
             num_ws_sources: 3,
         };
         let signal = evaluate(&ctx, &session, &config);
         if let Some(s) = signal {
-            assert!(s.size_usdc >= 4.0, "min 5 shares @ 0.80 = $4, got ${:.2}", s.size_usdc);
-            assert!(s.size_usdc <= 5.0, "capped at max_bet $5, got ${:.2}", s.size_usdc);
+            assert!(s.size_usdc >= 3.0, "min 5 shares @ 0.60 = $3, got ${:.2}", s.size_usdc);
+            assert!(s.size_usdc <= 3.0, "capped at max_bet $3, got ${:.2}", s.size_usdc);
         }
     }
 
     #[test]
     fn paper_session_loss_limit_40_portfolio() {
-        // After losing $20, session should stop (50% of $40 portfolio)
+        // After losing $10, session should stop (25% of $40 portfolio)
         let config = prod_config();
         let mut session = Session::new(40.0);
-        session.pnl_usdc = -20.0;
+        session.pnl_usdc = -10.0;
         let ctx = TradeContext {
             start_price: 100_000.0,
             chainlink_price: 100_050.0,
             exchange_price: Some(100_050.0),
             rtds_price: None,
             market_up_price: 0.50,
-            seconds_remaining: 10,
+            seconds_remaining: 8,
             fee_rate: 0.25,
-            vol_5min_pct: 0.10,
+            vol_5min_pct: 0.06,
             spread: 0.02,
             book_imbalance: 0.20,
             num_ws_sources: 3,
         };
         let signal = evaluate(&ctx, &session, &config);
-        assert!(signal.is_none(), "should stop after -$20 (50% of $40 portfolio)");
+        assert!(signal.is_none(), "should stop after -$10 (25% of $40 portfolio)");
     }
 
     #[test]
     fn paper_spread_eats_edge() {
-        // Moderate price move but wide spread kills the net edge below 5%
+        // Strong price move but wide spread kills the net edge below 3%
         // Disable max_spread filter to test spread cost mechanism specifically
         let config = StrategyConfig { max_spread: 0.0, ..prod_config() };
         let session = Session::new(40.0);
         let ctx = TradeContext {
             start_price: 100_000.0,
-            chainlink_price: 100_010.0, // +0.01%
-            exchange_price: Some(100_010.0),
+            chainlink_price: 100_050.0, // +0.05%
+            exchange_price: Some(100_050.0),
             rtds_price: None,
             market_up_price: 0.55,
-            seconds_remaining: 10,
+            seconds_remaining: 8,
             fee_rate: 0.25,
-            vol_5min_pct: 0.10,
-            spread: 0.20, // 10% spread cost → kills edge below 5%
+            vol_5min_pct: 0.06,
+            spread: 0.80, // 40% spread cost → kills edge below 3%
             book_imbalance: 0.20,
             num_ws_sources: 3,
         };
         let signal = evaluate(&ctx, &session, &config);
-        assert!(signal.is_none(), "wide spread should kill the edge below 5% min");
+        assert!(signal.is_none(), "wide spread should kill the edge below 3% min");
     }
 
     // --- Session bankroll tracking ---
