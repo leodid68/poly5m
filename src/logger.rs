@@ -155,6 +155,40 @@ impl CsvLogger {
     }
 }
 
+/// Logs the outcome of every 5-min window (even without a trade).
+/// Enables offline backtesting on all windows.
+pub struct OutcomeLogger {
+    writer: BufWriter<File>,
+}
+
+impl OutcomeLogger {
+    pub fn new(path: &str) -> Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .context("Cannot create outcomes CSV")?;
+        let needs_header = file.metadata().map(|m| m.len() == 0).unwrap_or(true);
+        let mut writer = BufWriter::new(file);
+        if needs_header {
+            writeln!(writer, "window,btc_start,btc_end,went_up,price_change_bps")?;
+            writer.flush()?;
+        }
+        Ok(Self { writer })
+    }
+
+    pub fn log_outcome(&mut self, window: u64, btc_start: f64, btc_end: f64) {
+        let went_up = btc_end >= btc_start;
+        let change_bps = if btc_start > 0.0 { (btc_end - btc_start) / btc_start * 10000.0 } else { 0.0 };
+        if let Err(e) = writeln!(
+            self.writer,
+            "{window},{btc_start:.2},{btc_end:.2},{went_up},{change_bps:.2}"
+        ).and_then(|_| self.writer.flush()) {
+            tracing::warn!("Outcome CSV write error: {e}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +283,42 @@ mod tests {
                 "Line {} has {} fields instead of 51: {}",
                 i, line.split(',').count(), &line[..line.len().min(80)]);
         }
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn outcome_logger_writes_header_and_row() {
+        let path = "/tmp/poly5m_test_outcomes.csv";
+        let _ = std::fs::remove_file(path);
+        let mut logger = super::OutcomeLogger::new(path).unwrap();
+        logger.log_outcome(1699999800, 97150.0, 97155.0);
+        drop(logger);
+
+        let content = std::fs::read_to_string(path).unwrap();
+        let lines: Vec<&str> = content.trim().lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("window,btc_start,"));
+        assert!(lines[1].contains("1699999800"));
+        assert!(lines[1].contains("true"));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn outcome_logger_appends_without_duplicate_header() {
+        let path = "/tmp/poly5m_test_outcomes_append.csv";
+        let _ = std::fs::remove_file(path);
+        {
+            let mut logger = super::OutcomeLogger::new(path).unwrap();
+            logger.log_outcome(1699999800, 97150.0, 97155.0);
+        }
+        {
+            let mut logger = super::OutcomeLogger::new(path).unwrap();
+            logger.log_outcome(1700000100, 97155.0, 97140.0);
+        }
+        let content = std::fs::read_to_string(path).unwrap();
+        let lines: Vec<&str> = content.trim().lines().collect();
+        assert_eq!(lines.len(), 3, "1 header + 2 data rows, got: {lines:?}");
+        assert!(lines[2].contains("false"));
         std::fs::remove_file(path).ok();
     }
 }

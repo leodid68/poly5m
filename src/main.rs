@@ -347,6 +347,22 @@ async fn main() -> Result<()> {
         None
     };
 
+    let mut outcome_csv = if !config.logging.csv_path.is_empty() {
+        let outcome_path = config.logging.csv_path.replace(".csv", "_outcomes.csv");
+        match logger::OutcomeLogger::new(&outcome_path) {
+            Ok(l) => {
+                tracing::info!("Outcome logging → {outcome_path}");
+                Some(l)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to create outcome logger: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let macro_http = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()?;
@@ -434,6 +450,9 @@ async fn main() -> Result<()> {
             // Enregistrer le mouvement de l'intervalle précédent pour la vol dynamique
             if current_window > 0 && start_price > 0.0 {
                 vol_tracker.record_move(start_price, current_btc);
+                if let Some(ref mut oc) = outcome_csv {
+                    oc.log_outcome(current_window, start_price, current_btc);
+                }
             }
 
             current_window = window;
