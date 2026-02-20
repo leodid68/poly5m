@@ -29,11 +29,15 @@ fee_rate_bps = 1000
 min_market_price = 0.05
 max_market_price = 0.95
 dry_run = true
-always_trade = true
+always_trade = false
 kelly_fraction = 0.25
 initial_bankroll_usdc = 100.0
 vol_lookback_intervals = 20
 default_vol_pct = 0.10
+vol_confidence_multiplier = 2.5
+min_payout_ratio = 0.08
+min_book_imbalance = 0.08
+max_vol_5min_pct = 0.12
 
 [rtds]
 enabled = true

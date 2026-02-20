@@ -122,6 +122,14 @@ struct StrategyToml {
     initial_bankroll_usdc: f64,
     #[serde(default)]
     always_trade: bool,
+    #[serde(default = "default_vol_confidence_multiplier")]
+    vol_confidence_multiplier: f64,
+    #[serde(default)]
+    min_payout_ratio: f64,
+    #[serde(default)]
+    min_book_imbalance: f64,
+    #[serde(default)]
+    max_vol_5min_pct: f64,
 }
 
 fn default_min_bet_usdc() -> f64 { 1.0 }
@@ -137,6 +145,7 @@ fn default_maker_timeout() -> u64 { 5 }
 fn default_max_spread() -> f64 { 0.0 }
 fn default_kelly_fraction() -> f64 { 0.25 }
 fn default_initial_bankroll() -> f64 { 40.0 }
+fn default_vol_confidence_multiplier() -> f64 { 1.0 }
 
 impl From<StrategyToml> for strategy::StrategyConfig {
     fn from(s: StrategyToml) -> Self {
@@ -156,6 +165,10 @@ impl From<StrategyToml> for strategy::StrategyConfig {
             kelly_fraction: s.kelly_fraction,
             initial_bankroll_usdc: s.initial_bankroll_usdc,
             always_trade: s.always_trade,
+            vol_confidence_multiplier: s.vol_confidence_multiplier,
+            min_payout_ratio: s.min_payout_ratio,
+            min_book_imbalance: s.min_book_imbalance,
+            max_vol_5min_pct: s.max_vol_5min_pct,
         }
     }
 }
@@ -438,16 +451,22 @@ async fn main() -> Result<()> {
             fee_rate: strat_config.fee_rate,
             vol_5min_pct: vol_tracker.current_vol(),
             spread: spread_book.spread,
+            book_imbalance: spread_book.imbalance,
         };
         let signal = match strategy::evaluate(&ctx, &session, &strat_config) {
             Some(s) => s,
             None => {
                 // Track skip reason pour le CSV
                 let price_change_pct = ((current_btc - start_price) / start_price * 100.0).abs();
-                if market_up_price < strat_config.min_market_price {
+                let vol = vol_tracker.current_vol();
+                if strat_config.max_vol_5min_pct > 0.0 && vol > strat_config.max_vol_5min_pct {
+                    skip_reason = format!("vol>{:.3}%", strat_config.max_vol_5min_pct);
+                } else if market_up_price < strat_config.min_market_price {
                     skip_reason = format!("mid<{:.2}", strat_config.min_market_price);
                 } else if market_up_price > strat_config.max_market_price {
                     skip_reason = format!("mid>{:.2}", strat_config.max_market_price);
+                } else if strat_config.min_book_imbalance > 0.0 && spread_book.imbalance < strat_config.min_book_imbalance {
+                    skip_reason = format!("imbal<{:.2}", strat_config.min_book_imbalance);
                 } else if strat_config.min_delta_pct > 0.0 && price_change_pct < strat_config.min_delta_pct {
                     skip_reason = format!("delta<{:.4}%", strat_config.min_delta_pct);
                 } else if strat_config.max_spread > 0.0 && spread_book.spread > strat_config.max_spread {

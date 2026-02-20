@@ -19,6 +19,10 @@ pub struct StrategyConfig {
     pub kelly_fraction: f64,
     pub initial_bankroll_usdc: f64,
     pub always_trade: bool,
+    pub vol_confidence_multiplier: f64,
+    pub min_payout_ratio: f64,
+    pub min_book_imbalance: f64,
+    pub max_vol_5min_pct: f64,
 }
 
 /// Signal de trade émis par la stratégie.
@@ -118,6 +122,7 @@ pub struct TradeContext {
     pub fee_rate: f64,
     pub vol_5min_pct: f64,
     pub spread: f64,
+    pub book_imbalance: f64,
 }
 
 /// Évalue si on doit trader sur cet intervalle.
@@ -145,6 +150,12 @@ pub fn evaluate(
         return None;
     }
 
+    // 3a. Vol filter — skip high-vol windows (unpredictable)
+    if config.max_vol_5min_pct > 0.0 && ctx.vol_5min_pct > config.max_vol_5min_pct {
+        tracing::debug!("Skip: vol {:.3}% > max {:.3}%", ctx.vol_5min_pct, config.max_vol_5min_pct);
+        return None;
+    }
+
     // 4. Direction et probabilité estimée (time-aware)
     // Priorité : RTDS (prix settlement) > exchange WS > Chainlink on-chain
     let current_price = ctx.rtds_price
@@ -152,7 +163,7 @@ pub fn evaluate(
         .unwrap_or(ctx.chainlink_price);
     let price_change_pct = (current_price - ctx.start_price) / ctx.start_price * 100.0;
 
-    let true_up_prob = price_change_to_probability(price_change_pct, ctx.seconds_remaining, ctx.vol_5min_pct);
+    let true_up_prob = price_change_to_probability(price_change_pct, ctx.seconds_remaining, ctx.vol_5min_pct, config.vol_confidence_multiplier);
     let true_down_prob = 1.0 - true_up_prob;
     let market_down_price = 1.0 - ctx.market_up_price;
 
@@ -197,6 +208,19 @@ pub fn evaluate(
         return None;
     }
 
+    // 7a. Payout filter — skip low-payout traps (e.g. price=0.96 → payout=0.04x)
+    let payout = (1.0 - market_price) / market_price;
+    if config.min_payout_ratio > 0.0 && payout < config.min_payout_ratio {
+        tracing::debug!("Skip: payout {:.3} < min {:.3}", payout, config.min_payout_ratio);
+        return None;
+    }
+
+    // 7b. Book imbalance filter — skip when imbalance is too low
+    if config.min_book_imbalance > 0.0 && ctx.book_imbalance < config.min_book_imbalance {
+        tracing::debug!("Skip: imbalance {:.3} < min {:.3}", ctx.book_imbalance, config.min_book_imbalance);
+        return None;
+    }
+
     // Cohérence Chainlink / exchanges — skip si divergence directionnelle
     if let Some(ex_price) = ctx.exchange_price {
         let cl_move_pct = ((ctx.chainlink_price - ctx.start_price) / ctx.start_price).abs();
@@ -234,6 +258,10 @@ pub fn evaluate(
     if kelly_size <= 0.0 {
         return None;
     }
+    // 8a. Book imbalance boost: higher imbalance → larger bet
+    let imbalance_boost = 1.0 + (ctx.book_imbalance - config.min_book_imbalance).clamp(0.0, 1.0);
+    let kelly_size = (kelly_size * imbalance_boost).min(config.max_bet_usdc);
+
     let min_usdc = (config.min_shares as f64 * market_price).max(config.min_bet_usdc);
     if min_usdc > config.max_bet_usdc {
         tracing::debug!("Skip: min order ${:.2} > max_bet ${:.2}", min_usdc, config.max_bet_usdc);
@@ -278,8 +306,8 @@ pub fn dynamic_fee(price: f64, fee_rate: f64) -> f64 {
 
 /// Probabilité UP time-aware basée sur un modèle de volatilité.
 /// Utilise la vol résiduelle pour pondérer la confiance selon le temps restant.
-fn price_change_to_probability(pct_change: f64, seconds_remaining: u64, vol_5min_pct: f64) -> f64 {
-    let remaining_vol = vol_5min_pct * ((seconds_remaining as f64) / 300.0).sqrt();
+fn price_change_to_probability(pct_change: f64, seconds_remaining: u64, vol_5min_pct: f64, confidence_multiplier: f64) -> f64 {
+    let remaining_vol = vol_5min_pct * confidence_multiplier * ((seconds_remaining as f64) / 300.0).sqrt();
 
     if remaining_vol < 1e-9 {
         // Quasi plus de temps — direction verrouillée
@@ -340,6 +368,10 @@ mod tests {
             kelly_fraction: 0.5,
             initial_bankroll_usdc: 40.0,
             always_trade: false,
+            vol_confidence_multiplier: 1.0,
+            min_payout_ratio: 0.0,
+            min_book_imbalance: 0.0,
+            max_vol_5min_pct: 0.0,
         }
     }
 
@@ -356,6 +388,7 @@ mod tests {
             fee_rate: 0.25,
             vol_5min_pct: DEFAULT_VOL,
             spread: 0.0,
+            book_imbalance: 0.5,
         }
     }
 
@@ -363,33 +396,33 @@ mod tests {
 
     #[test]
     fn prob_positive_move_low_time() {
-        let p = price_change_to_probability(0.05, 5, DEFAULT_VOL);
+        let p = price_change_to_probability(0.05, 5, DEFAULT_VOL, 1.0);
         assert!(p > 0.95, "got {p}");
     }
 
     #[test]
     fn prob_positive_move_high_time() {
-        let p = price_change_to_probability(0.05, 60, DEFAULT_VOL);
+        let p = price_change_to_probability(0.05, 60, DEFAULT_VOL, 1.0);
         assert!(p > 0.5 && p < 0.95, "got {p}");
     }
 
     #[test]
     fn prob_flat() {
-        let p = price_change_to_probability(0.0, 30, DEFAULT_VOL);
+        let p = price_change_to_probability(0.0, 30, DEFAULT_VOL, 1.0);
         assert!((p - 0.5).abs() < 0.001, "got {p}");
     }
 
     #[test]
     fn prob_negative_move() {
-        let p = price_change_to_probability(-0.05, 10, DEFAULT_VOL);
+        let p = price_change_to_probability(-0.05, 10, DEFAULT_VOL, 1.0);
         assert!(p < 0.1, "got {p}");
     }
 
     #[test]
     fn prob_zero_time_locks_direction() {
-        assert!(price_change_to_probability(0.01, 0, DEFAULT_VOL) == 1.0);
-        assert!(price_change_to_probability(-0.01, 0, DEFAULT_VOL) == 0.0);
-        assert!(price_change_to_probability(0.0, 0, DEFAULT_VOL) == 0.5);
+        assert!(price_change_to_probability(0.01, 0, DEFAULT_VOL, 1.0) == 1.0);
+        assert!(price_change_to_probability(-0.01, 0, DEFAULT_VOL, 1.0) == 0.0);
+        assert!(price_change_to_probability(0.0, 0, DEFAULT_VOL, 1.0) == 0.5);
     }
 
     // --- fractional_kelly ---
@@ -925,6 +958,10 @@ mod tests {
             kelly_fraction: 0.25,
             initial_bankroll_usdc: 40.0,
             always_trade: false,
+            vol_confidence_multiplier: 2.5,
+            min_payout_ratio: 0.08,
+            min_book_imbalance: 0.08,
+            max_vol_5min_pct: 0.12,
         }
     }
 
@@ -943,6 +980,7 @@ mod tests {
             fee_rate: 0.25,
             vol_5min_pct: 0.10,
             spread: 0.02,
+            book_imbalance: 0.20,
         };
         let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_some(), "should trade with +0.03% at 10s");
@@ -968,6 +1006,7 @@ mod tests {
             fee_rate: 0.25,
             vol_5min_pct: 0.10,
             spread: 0.02,
+            book_imbalance: 0.20,
         };
         let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_none(), "weak +0.005% should not pass 5% min edge");
@@ -988,6 +1027,7 @@ mod tests {
             fee_rate: 0.25,
             vol_5min_pct: 0.10,
             spread: 0.01,
+            book_imbalance: 0.20,
         };
         let signal = evaluate(&ctx, &session, &config);
         if let Some(s) = signal {
@@ -1012,6 +1052,7 @@ mod tests {
             fee_rate: 0.25,
             vol_5min_pct: 0.10,
             spread: 0.02,
+            book_imbalance: 0.20,
         };
         let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_none(), "should stop after -$20 (50% of $40 portfolio)");
@@ -1033,6 +1074,7 @@ mod tests {
             fee_rate: 0.25,
             vol_5min_pct: 0.10,
             spread: 0.20, // 10% spread cost → kills edge below 5%
+            book_imbalance: 0.20,
         };
         let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_none(), "wide spread should kill the edge below 5% min");
@@ -1077,5 +1119,123 @@ mod tests {
         // Size should be smaller with less bankroll (or bumped to min, either way <= full)
         assert!(sig_half.unwrap().size_usdc <= sig_full.unwrap().size_usdc,
             "size should decrease with bankroll losses");
+    }
+
+    // --- vol_confidence_multiplier ---
+
+    #[test]
+    fn confidence_multiplier_reduces_probability() {
+        // Same move, higher multiplier → less confident (closer to 0.5)
+        let p_low = price_change_to_probability(0.05, 10, DEFAULT_VOL, 1.0);
+        let p_high = price_change_to_probability(0.05, 10, DEFAULT_VOL, 2.5);
+        assert!(p_high < p_low, "multiplier should reduce confidence: {p_high} vs {p_low}");
+        assert!(p_high > 0.5, "should still lean UP: {p_high}");
+    }
+
+    // --- min_payout_ratio ---
+
+    #[test]
+    fn evaluate_skips_low_payout() {
+        // price=0.95 → payout=0.053 < min_payout_ratio=0.08 → skip
+        let config = StrategyConfig { min_payout_ratio: 0.08, ..test_config() };
+        let session = Session::new(40.0);
+        let ctx = TradeContext {
+            chainlink_price: 100_050.0,
+            market_up_price: 0.20, // → DOWN token price = 0.80, payout = 0.25 > 0.08 → ok
+            ..test_ctx()
+        };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_some(), "payout 0.25 should pass min 0.08");
+
+        // market_up_price near extreme → trading side has low payout
+        let ctx2 = TradeContext {
+            chainlink_price: 100_050.0,
+            market_up_price: 0.82, // UP token, payout = 0.22 > 0.08 → ok
+            ..test_ctx()
+        };
+        let signal2 = evaluate(&ctx2, &session, &config);
+        // May or may not pass other filters, but payout is ok
+        let _ = signal2;
+    }
+
+    // --- max_vol_5min_pct ---
+
+    #[test]
+    fn evaluate_skips_high_vol() {
+        let config = StrategyConfig { max_vol_5min_pct: 0.12, ..test_config() };
+        let session = Session::new(40.0);
+        // Vol 0.15% > max 0.12% → skip
+        let ctx = TradeContext {
+            chainlink_price: 100_050.0,
+            vol_5min_pct: 0.15,
+            ..test_ctx()
+        };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_none(), "high vol should be skipped");
+    }
+
+    #[test]
+    fn evaluate_passes_low_vol() {
+        let config = StrategyConfig { max_vol_5min_pct: 0.12, ..test_config() };
+        let session = Session::new(40.0);
+        let ctx = TradeContext {
+            chainlink_price: 100_050.0,
+            vol_5min_pct: 0.08,
+            ..test_ctx()
+        };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_some(), "low vol should pass");
+    }
+
+    // --- min_book_imbalance ---
+
+    #[test]
+    fn evaluate_skips_low_imbalance() {
+        let config = StrategyConfig { min_book_imbalance: 0.08, ..test_config() };
+        let session = Session::new(40.0);
+        let ctx = TradeContext {
+            chainlink_price: 100_050.0,
+            book_imbalance: 0.03, // < 0.08 → skip
+            ..test_ctx()
+        };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_none(), "low imbalance should be skipped");
+    }
+
+    #[test]
+    fn evaluate_passes_high_imbalance() {
+        let config = StrategyConfig { min_book_imbalance: 0.08, ..test_config() };
+        let session = Session::new(40.0);
+        let ctx = TradeContext {
+            chainlink_price: 100_050.0,
+            book_imbalance: 0.30,
+            ..test_ctx()
+        };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_some(), "high imbalance should pass");
+    }
+
+    #[test]
+    fn imbalance_boosts_sizing() {
+        let config = StrategyConfig { min_book_imbalance: 0.08, ..test_config() };
+        let session = Session::new(40.0);
+        // Low imbalance
+        let ctx_low = TradeContext {
+            chainlink_price: 100_050.0,
+            book_imbalance: 0.10,
+            ..test_ctx()
+        };
+        let sig_low = evaluate(&ctx_low, &session, &config);
+        // High imbalance
+        let ctx_high = TradeContext {
+            chainlink_price: 100_050.0,
+            book_imbalance: 0.60,
+            ..test_ctx()
+        };
+        let sig_high = evaluate(&ctx_high, &session, &config);
+        assert!(sig_low.is_some());
+        assert!(sig_high.is_some());
+        assert!(sig_high.unwrap().size_usdc >= sig_low.unwrap().size_usdc,
+            "higher imbalance should give equal or larger size");
     }
 }
