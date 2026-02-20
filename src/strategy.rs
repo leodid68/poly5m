@@ -64,6 +64,10 @@ pub struct Session {
     pub circuit_breaker_until: u64,
     /// Current consecutive loss count (resets on any win).
     pub consecutive_losses: u32,
+    /// Current consecutive win count (resets on any loss).
+    pub consecutive_wins: u32,
+    /// Minimum PnL reached during session (for drawdown calculation).
+    pub min_pnl: f64,
 }
 
 impl Default for Session {
@@ -72,6 +76,8 @@ impl Default for Session {
             pnl_usdc: 0.0, trades: 0, wins: 0, initial_bankroll: 0.0,
             recent_outcomes: VecDeque::new(), circuit_breaker_until: 0,
             consecutive_losses: 0,
+            consecutive_wins: 0,
+            min_pnl: 0.0,
         }
     }
 }
@@ -92,8 +98,13 @@ impl Session {
         if won {
             self.wins += 1;
             self.consecutive_losses = 0;
+            self.consecutive_wins += 1;
         } else {
             self.consecutive_losses += 1;
+            self.consecutive_wins = 0;
+        }
+        if self.pnl_usdc < self.min_pnl {
+            self.min_pnl = self.pnl_usdc;
         }
         self.recent_outcomes.push_back(won);
     }
@@ -131,6 +142,15 @@ impl Session {
     /// Returns true if circuit breaker is active (should not trade).
     pub fn is_circuit_broken(&self, now: u64) -> bool {
         self.circuit_breaker_until > now
+    }
+
+    /// Returns session drawdown as a percentage of initial bankroll.
+    /// Drawdown = how far below zero PnL has gone, expressed as % of bankroll.
+    pub fn session_drawdown_pct(&self) -> f64 {
+        if self.initial_bankroll <= 0.0 {
+            return 0.0;
+        }
+        (-self.min_pnl / self.initial_bankroll * 100.0).max(0.0)
     }
 }
 
