@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::strategy::StrategyConfig;
 
 /// Returns the "Sniper Conservateur" preset.

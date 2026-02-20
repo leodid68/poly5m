@@ -219,16 +219,52 @@ async fn main() -> Result<()> {
         .init();
 
     let config = load_config()?;
-    let dry_run = config.strategy.dry_run;
     let poll_ms_base = config.chainlink.poll_interval_ms;
     let poll_ms_ws = config.chainlink.poll_interval_ms_with_ws;
-    let vol_lookback = config.strategy.vol_lookback_intervals;
-    let default_vol = config.strategy.default_vol_pct;
-    let order_type = config.strategy.order_type.clone();
-    let maker_timeout_s = config.strategy.maker_timeout_s;
-    let default_fee_rate_bps = config.strategy.fee_rate_bps; // for EIP-712 order signing
-    let strat_config = strategy::StrategyConfig::from(config.strategy);
+    let default_fee_rate_bps = config.strategy.fee_rate_bps;
     let feed: Address = config.chainlink.btc_usd_feed.parse().context("Invalid feed address")?;
+
+    // Profile selection: --profile <name> or interactive menu or config.toml
+    let profile_name = std::env::args()
+        .skip_while(|a| a != "--profile")
+        .nth(1);
+
+    let (strat_config, dry_run, order_type, maker_timeout_s, vol_lookback, default_vol) =
+        if let Some(ref name) = profile_name {
+            let preset = presets::get(name)
+                .unwrap_or_else(|| {
+                    eprintln!("Profil inconnu: {name}. Disponibles: sniper, conviction, scalper, farm");
+                    std::process::exit(1);
+                });
+            let dry_run = name == "farm";
+            let order_type = match name.as_str() {
+                "sniper" | "conviction" => "GTC".to_string(),
+                _ => "FOK".to_string(),
+            };
+            let maker_timeout_s = if &order_type == "GTC" { 3 } else { config.strategy.maker_timeout_s };
+            tracing::info!("Profil: {name}");
+            (preset, dry_run, order_type, maker_timeout_s,
+                config.strategy.vol_lookback_intervals, config.strategy.default_vol_pct)
+        } else if let Some(name) = presets::interactive_menu() {
+            let preset = presets::get(name).unwrap();
+            let dry_run = name == "farm";
+            let order_type = match name {
+                "sniper" | "conviction" => "GTC".to_string(),
+                _ => "FOK".to_string(),
+            };
+            let maker_timeout_s = if &order_type == "GTC" { 3 } else { config.strategy.maker_timeout_s };
+            tracing::info!("Profil: {name}");
+            (preset, dry_run, order_type, maker_timeout_s,
+                config.strategy.vol_lookback_intervals, config.strategy.default_vol_pct)
+        } else {
+            let dry_run = config.strategy.dry_run;
+            let order_type = config.strategy.order_type.clone();
+            let maker_timeout_s = config.strategy.maker_timeout_s;
+            let vol_lookback = config.strategy.vol_lookback_intervals;
+            let default_vol = config.strategy.default_vol_pct;
+            let strat_config = strategy::StrategyConfig::from(config.strategy);
+            (strat_config, dry_run, order_type, maker_timeout_s, vol_lookback, default_vol)
+        };
 
     // Providers Chainlink — timeouts serrés pour le racing
     let providers = config.chainlink.rpc_urls.iter()
