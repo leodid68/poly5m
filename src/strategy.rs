@@ -94,6 +94,7 @@ impl Session {
     pub fn record_trade(&mut self, pnl: f64) {
         self.pnl_usdc += pnl;
         self.trades += 1;
+        // Break-even (pnl == 0.0) treated as loss: costs opportunity, resets win streak.
         let won = pnl > 0.0;
         if won {
             self.wins += 1;
@@ -184,10 +185,10 @@ impl VolTracker {
             return self.default_vol;
         }
         let mut sorted: Vec<f64> = self.recent_moves.iter().copied().collect();
-        sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median = sorted[sorted.len() / 2];
         let mut deviations: Vec<f64> = sorted.iter().map(|x| (x - median).abs()).collect();
-        deviations.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        deviations.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let mad = deviations[deviations.len() / 2];
         // MAD → std dev: σ ≈ 1.4826 × MAD (for normal distribution)
         (1.4826 * mad).clamp(0.01, 1.0)
@@ -284,8 +285,8 @@ impl WindowTicks {
         max_dd
     }
 
-    /// Seconds the price spent above start_price.
-    pub fn time_at_extreme_s(&self, start_price: f64) -> u64 {
+    /// Seconds the price spent at or above start_price.
+    pub fn time_above_start_s(&self, start_price: f64) -> u64 {
         if self.timestamps_ms.len() < 2 { return 0; }
         let mut above_ms = 0u64;
         for i in 1..self.timestamps_ms.len() {
@@ -1935,13 +1936,13 @@ mod tests {
     }
 
     #[test]
-    fn window_ticks_time_at_extreme() {
+    fn window_ticks_time_above_start() {
         let mut wt = WindowTicks::new();
         wt.tick(100.0, 0);
         wt.tick(100.5, 1000);
         wt.tick(100.3, 2000);
         wt.tick(99.8, 3000);
-        assert_eq!(wt.time_at_extreme_s(100.0), 2);
+        assert_eq!(wt.time_above_start_s(100.0), 2);
     }
 
     #[test]
@@ -2045,6 +2046,28 @@ mod tests {
             assert!(sc.size_usdc <= sig_good.unwrap().size_usdc,
                 "choppy regime should reduce sizing");
         }
+    }
+
+    #[test]
+    fn consecutive_wins_tracked() {
+        let mut s = Session::new(40.0);
+        s.record_trade(1.0);
+        s.record_trade(1.0);
+        assert_eq!(s.consecutive_wins, 2);
+        s.record_trade(-1.0);
+        assert_eq!(s.consecutive_wins, 0);
+        s.record_trade(1.0);
+        assert_eq!(s.consecutive_wins, 1);
+    }
+
+    #[test]
+    fn session_drawdown_pct_calculation() {
+        let mut s = Session::new(40.0);
+        s.record_trade(-5.0);
+        assert!((s.session_drawdown_pct() - 12.5).abs() < 0.01);
+        s.record_trade(10.0);
+        // drawdown stays at worst point
+        assert!((s.session_drawdown_pct() - 12.5).abs() < 0.01);
     }
 
     #[test]
