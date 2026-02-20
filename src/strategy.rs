@@ -27,6 +27,13 @@ pub struct StrategyConfig {
     pub circuit_breaker_window: usize,
     pub circuit_breaker_min_wr: f64,
     pub circuit_breaker_cooldown_s: u64,
+    /// Minimum implied probability to trade. Filters out low-confidence predictions.
+    /// Data shows WR drops when model isn't confident. Set 0.0 to disable.
+    /// Recommended: 0.70+ (only trade when model says 70%+ chance of being right).
+    pub min_implied_prob: f64,
+    /// Maximum consecutive losses before pausing (0 = disabled).
+    /// Data shows loss streaks of 13 — this caps exposure during drawdowns.
+    pub max_consecutive_losses: u32,
 }
 
 /// Signal de trade émis par la stratégie.
@@ -52,6 +59,8 @@ pub struct Session {
     recent_outcomes: VecDeque<bool>,
     /// Timestamp (unix secs) when circuit breaker was triggered. 0 = not active.
     pub circuit_breaker_until: u64,
+    /// Current consecutive loss count (resets on any win).
+    pub consecutive_losses: u32,
 }
 
 impl Default for Session {
@@ -59,6 +68,7 @@ impl Default for Session {
         Self {
             pnl_usdc: 0.0, trades: 0, wins: 0, initial_bankroll: 0.0,
             recent_outcomes: VecDeque::new(), circuit_breaker_until: 0,
+            consecutive_losses: 0,
         }
     }
 }
@@ -78,6 +88,9 @@ impl Session {
         let won = pnl > 0.0;
         if won {
             self.wins += 1;
+            self.consecutive_losses = 0;
+        } else {
+            self.consecutive_losses += 1;
         }
         self.recent_outcomes.push_back(won);
     }
@@ -141,16 +154,20 @@ impl VolTracker {
         }
     }
 
-    /// Volatilité estimée (std dev des mouvements récents).
+    /// Volatilité estimée (MAD — résiste aux outliers).
     /// Retourne default_vol si pas assez de données (< 3 samples).
     pub fn current_vol(&self) -> f64 {
         if self.recent_moves.len() < 3 {
             return self.default_vol;
         }
-        let n = self.recent_moves.len() as f64;
-        let mean = self.recent_moves.iter().sum::<f64>() / n;
-        let variance = self.recent_moves.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
-        variance.sqrt().clamp(0.01, 1.0)
+        let mut sorted: Vec<f64> = self.recent_moves.iter().copied().collect();
+        sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = sorted[sorted.len() / 2];
+        let mut deviations: Vec<f64> = sorted.iter().map(|x| (x - median).abs()).collect();
+        deviations.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        let mad = deviations[deviations.len() / 2];
+        // MAD → std dev: σ ≈ 1.4826 × MAD (for normal distribution)
+        (1.4826 * mad).clamp(0.01, 1.0)
     }
 }
 
@@ -255,6 +272,13 @@ pub fn evaluate(
     }
 
     // 7. Normal mode: apply all filters
+
+    // 7.0 Consecutive loss limit — stop digging when on tilt
+    if config.max_consecutive_losses > 0 && session.consecutive_losses >= config.max_consecutive_losses {
+        tracing::debug!("Skip: {} consecutive losses >= max {}", session.consecutive_losses, config.max_consecutive_losses);
+        return None;
+    }
+
     if ctx.market_up_price < config.min_market_price || ctx.market_up_price > config.max_market_price {
         return None;
     }
@@ -297,6 +321,13 @@ pub fn evaluate(
     }
 
     if edge <= 0.0 || net_edge_pct < config.min_edge_pct {
+        return None;
+    }
+
+    // 7c. Minimum implied probability — only trade when model is confident
+    // Data shows that low-confidence trades (prob close to 0.5) lose money
+    if config.min_implied_prob > 0.0 && true_prob < config.min_implied_prob && (1.0 - true_prob) < config.min_implied_prob {
+        tracing::debug!("Skip: implied prob {:.3} too close to 50/50 (min {:.3})", true_prob.max(1.0 - true_prob), config.min_implied_prob);
         return None;
     }
 
@@ -429,6 +460,8 @@ mod tests {
             circuit_breaker_window: 0,
             circuit_breaker_min_wr: 0.0,
             circuit_breaker_cooldown_s: 1800,
+            min_implied_prob: 0.0,
+            max_consecutive_losses: 0,
         }
     }
 
@@ -1018,12 +1051,14 @@ mod tests {
             always_trade: false,
             vol_confidence_multiplier: 2.5,
             min_payout_ratio: 0.08,
-            min_book_imbalance: 0.08,
-            max_vol_5min_pct: 0.12,
+            min_book_imbalance: 0.05,  // Data: <5% imbalance = 2-13% WR
+            max_vol_5min_pct: 0.10,    // Data: only <10bp vol is profitable
             min_ws_sources: 3,
             circuit_breaker_window: 15,
             circuit_breaker_min_wr: 0.25,
             circuit_breaker_cooldown_s: 1800,
+            min_implied_prob: 0.70,    // Data: low-confidence trades lose
+            max_consecutive_losses: 8, // Data: max loss streak was 13
         }
     }
 
@@ -1382,5 +1417,118 @@ mod tests {
         }
         s.check_circuit_breaker(15, 0.25, 1800, 1000);
         assert!(!s.is_circuit_broken(1000));
+    }
+
+    // --- consecutive losses ---
+
+    #[test]
+    fn consecutive_losses_tracked() {
+        let mut s = Session::new(40.0);
+        s.record_trade(-1.0);
+        s.record_trade(-1.0);
+        s.record_trade(-1.0);
+        assert_eq!(s.consecutive_losses, 3);
+        s.record_trade(1.0); // win resets
+        assert_eq!(s.consecutive_losses, 0);
+        s.record_trade(-1.0);
+        assert_eq!(s.consecutive_losses, 1);
+    }
+
+    #[test]
+    fn evaluate_skips_after_max_consecutive_losses() {
+        let config = StrategyConfig { max_consecutive_losses: 5, ..test_config() };
+        let mut session = Session::new(40.0);
+        // Record 5 consecutive losses
+        for _ in 0..5 {
+            session.record_trade(-1.0);
+        }
+        assert_eq!(session.consecutive_losses, 5);
+        let ctx = TradeContext { chainlink_price: 100_050.0, ..test_ctx() };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_none(), "should skip after 5 consecutive losses");
+    }
+
+    #[test]
+    fn evaluate_resumes_after_consec_loss_reset() {
+        let config = StrategyConfig { max_consecutive_losses: 5, ..test_config() };
+        let mut session = Session::new(40.0);
+        for _ in 0..5 {
+            session.record_trade(-1.0);
+        }
+        // This won't help because evaluate checks but doesn't reset
+        // The user must manually (or via circuit breaker timeout) allow resume
+        // Actually: consecutive_losses resets on any win via record_trade
+        session.record_trade(1.0); // win! resets to 0
+        assert_eq!(session.consecutive_losses, 0);
+        let ctx = TradeContext { chainlink_price: 100_050.0, ..test_ctx() };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_some(), "should resume after loss streak broken by win");
+    }
+
+    // --- min_implied_prob ---
+
+    #[test]
+    fn evaluate_skips_low_confidence() {
+        let config = StrategyConfig {
+            min_implied_prob: 0.70,
+            min_edge_pct: 0.1, // low so edge isn't the blocker
+            ..test_config()
+        };
+        let session = Session::new(40.0);
+        // Small move → prob close to 0.5 → below 0.70 threshold
+        let ctx = TradeContext {
+            chainlink_price: 100_002.0, // +0.002% — tiny, prob ~0.52
+            ..test_ctx()
+        };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_none(), "low confidence should be skipped");
+    }
+
+    #[test]
+    fn evaluate_passes_high_confidence() {
+        let config = StrategyConfig {
+            min_implied_prob: 0.70,
+            min_edge_pct: 0.1,
+            ..test_config()
+        };
+        let session = Session::new(40.0);
+        // Large move → high prob → above 0.70 threshold
+        let ctx = TradeContext {
+            chainlink_price: 100_050.0, // +0.05% with 10s remaining → prob ~0.99
+            ..test_ctx()
+        };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_some(), "high confidence should pass");
+    }
+
+    // --- data-driven prod config test ---
+
+    #[test]
+    fn prod_config_data_driven_values() {
+        let cfg = prod_config();
+        // Data analysis: min_book_imbalance should be >= 0.05 (WR drops below 5% under this)
+        assert!(cfg.min_book_imbalance >= 0.05, "imbalance threshold too low");
+        // Data analysis: max_vol_5min_pct should be <= 0.10 (only <10bp profitable)
+        assert!(cfg.max_vol_5min_pct <= 0.10, "vol threshold too high");
+        // Data analysis: min_implied_prob should be >= 0.70
+        assert!(cfg.min_implied_prob >= 0.70, "confidence threshold too low");
+        // Data analysis: max_consecutive_losses should be set
+        assert!(cfg.max_consecutive_losses > 0 && cfg.max_consecutive_losses <= 10, "consec loss limit not set properly");
+    }
+
+    #[test]
+    fn vol_tracker_mad_resists_outlier() {
+        let mut vt = VolTracker::new(20, 0.12);
+        // 9 normal moves ~0.05%
+        for _ in 0..9 {
+            vt.record_move(100_000.0, 100_050.0); // +0.05%
+        }
+        let vol_before = vt.current_vol();
+        // Add one extreme outlier (+2%)
+        vt.record_move(100_000.0, 102_000.0);
+        let vol_after = vt.current_vol();
+        // MAD should resist: vol should not jump more than 2x
+        assert!(vol_after < vol_before * 2.0,
+            "MAD should resist outlier: before={vol_before:.4}, after={vol_after:.4}");
     }
 }
