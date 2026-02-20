@@ -11,7 +11,7 @@ impl CsvLogger {
     pub fn new(path: &str) -> Result<Self> {
         let file = File::create(path).context("Cannot create CSV log file")?;
         let mut writer = BufWriter::new(file);
-        writeln!(writer, "timestamp,window,event,btc_start,btc_current,btc_resolution,price_change_pct,market_mid,implied_p_up,side,token,edge_brut_pct,edge_net_pct,fee_pct,size_usdc,entry_price,remaining_s,num_ws_src,vol_pct,btc_1h_pct,btc_24h_pct,btc_24h_vol_m,funding_rate,spread,bid_depth,ask_depth,book_imbalance,bid_levels,ask_levels,result,pnl,session_pnl,session_trades,session_wr_pct")?;
+        writeln!(writer, "timestamp,hour_utc,window,event,btc_start,btc_current,btc_resolution,price_change_pct,market_mid,implied_p_up,side,token,edge_brut_pct,edge_net_pct,fee_pct,size_usdc,entry_price,remaining_s,num_ws_src,vol_pct,btc_1h_pct,btc_24h_pct,btc_24h_vol_m,funding_rate,spread,bid_depth,ask_depth,book_imbalance,bid_levels,ask_levels,result,pnl,session_pnl,session_trades,session_wr_pct")?;
         writer.flush()?;
         Ok(Self { writer })
     }
@@ -44,10 +44,11 @@ impl CsvLogger {
         bid_levels: u32,
         ask_levels: u32,
     ) {
+        let hour_utc = (timestamp % 86400) / 3600;
         let change_pct = if btc_start > 0.0 { (btc_current - btc_start) / btc_start * 100.0 } else { 0.0 };
         if let Err(e) = writeln!(
             self.writer,
-            "{timestamp},{window},trade,{btc_start:.2},{btc_current:.2},,{change_pct:.4},{market_mid:.4},{implied_p_up:.4},{side},{token},{edge_brut:.2},{edge_net:.2},{fee_pct:.2},{size_usdc:.2},{entry_price:.4},{remaining_s},{num_ws},{vol_pct:.4},{:.4},{:.4},{:.1},{:.8},{spread:.4},{bid_depth:.2},{ask_depth:.2},{imbalance:.4},{bid_levels},{ask_levels},,,,,",
+            "{timestamp},{hour_utc},{window},trade,{btc_start:.2},{btc_current:.2},,{change_pct:.4},{market_mid:.4},{implied_p_up:.4},{side},{token},{edge_brut:.2},{edge_net:.2},{fee_pct:.2},{size_usdc:.2},{entry_price:.4},{remaining_s},{num_ws},{vol_pct:.4},{:.4},{:.4},{:.1},{:.8},{spread:.4},{bid_depth:.2},{ask_depth:.2},{imbalance:.4},{bid_levels},{ask_levels},,,,,",
             macro_data.btc_1h_pct, macro_data.btc_24h_pct, macro_data.btc_24h_vol_m, macro_data.funding_rate,
         ).and_then(|_| self.writer.flush()) {
             tracing::warn!("CSV write error: {e}");
@@ -68,10 +69,11 @@ impl CsvLogger {
         session_trades: u32,
         session_wr: f64,
     ) {
+        let hour_utc = (timestamp % 86400) / 3600;
         let change_pct = if btc_start > 0.0 { (btc_resolution - btc_start) / btc_start * 100.0 } else { 0.0 };
         if let Err(e) = writeln!(
             self.writer,
-            "{timestamp},{window},resolution,{btc_start:.2},,{btc_resolution:.2},{change_pct:.4},,,,,,,,,,,,,,,,,,,,,,,{result},{pnl:.4},{session_pnl:.4},{session_trades},{session_wr:.1}"
+            "{timestamp},{hour_utc},{window},resolution,{btc_start:.2},,{btc_resolution:.2},{change_pct:.4},,,,,,,,,,,,,,,,,,,,,,,{result},{pnl:.4},{session_pnl:.4},{session_trades},{session_wr:.1}"
         ).and_then(|_| self.writer.flush()) {
             tracing::warn!("CSV write error: {e}");
         }
@@ -91,10 +93,11 @@ impl CsvLogger {
         macro_data: &MacroData,
         reason: &str,
     ) {
+        let hour_utc = (timestamp % 86400) / 3600;
         let change_pct = if btc_start > 0.0 { (btc_end - btc_start) / btc_start * 100.0 } else { 0.0 };
         if let Err(e) = writeln!(
             self.writer,
-            "{timestamp},{window},skip,{btc_start:.2},{btc_end:.2},,{change_pct:.4},{market_mid:.4},,{reason},,,,,,,,{num_ws},{vol_pct:.4},{:.4},{:.4},{:.1},{:.8},,,,,,,,,,,",
+            "{timestamp},{hour_utc},{window},skip,{btc_start:.2},{btc_end:.2},,{change_pct:.4},{market_mid:.4},,{reason},,,,,,,,{num_ws},{vol_pct:.4},{:.4},{:.4},{:.1},{:.8},,,,,,,,,,,",
             macro_data.btc_1h_pct, macro_data.btc_24h_pct, macro_data.btc_24h_vol_m, macro_data.funding_rate,
         ).and_then(|_| self.writer.flush()) {
             tracing::warn!("CSV write error: {e}");
@@ -123,7 +126,7 @@ mod tests {
         File::open(path).unwrap().read_to_string(&mut content).unwrap();
         let lines: Vec<&str> = content.trim().lines().collect();
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].starts_with("timestamp,window,event,"));
+        assert!(lines[0].starts_with("timestamp,hour_utc,window,event,"));
         assert!(lines[0].contains(",btc_1h_pct,btc_24h_pct,"));
         assert!(lines[1].contains(",trade,"));
         assert!(lines[1].contains("BUY_UP"));
@@ -178,8 +181,8 @@ mod tests {
 
         let content = std::fs::read_to_string(path).unwrap();
         for (i, line) in content.trim().lines().enumerate() {
-            assert_eq!(line.split(',').count(), 34,
-                "Line {} has {} fields instead of 34: {}",
+            assert_eq!(line.split(',').count(), 35,
+                "Line {} has {} fields instead of 35: {}",
                 i, line.split(',').count(), &line[..line.len().min(60)]);
         }
         std::fs::remove_file(path).ok();
