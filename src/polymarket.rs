@@ -36,7 +36,7 @@ sol! {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Side {
     Buy,
     Sell,
@@ -127,6 +127,30 @@ pub struct BookData {
     pub num_ask_levels: u32,
 }
 
+/// Retry an async operation up to 3 times with 200ms/500ms delays.
+/// Used for read-only API calls only (NOT for order placement).
+async fn retry<F, Fut, T>(f: F) -> Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    const DELAYS_MS: [u64; 2] = [200, 500];
+    let mut last_err = None;
+    for attempt in 0..3 {
+        match f().await {
+            Ok(val) => return Ok(val),
+            Err(e) => {
+                if let Some(&delay) = DELAYS_MS.get(attempt) {
+                    tracing::debug!("API retry {}/{}: {e:#}", attempt + 1, 3);
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap())
+}
+
 impl PolymarketClient {
     pub fn new(
         api_key: String,
@@ -155,115 +179,122 @@ impl PolymarketClient {
         let slug = format!("btc-updown-5m-{window_ts}");
         tracing::debug!(slug = %slug, "Looking up 5min BTC market");
 
-        let resp = self.http
-            .get(format!("{GAMMA_BASE}/events"))
-            .query(&[("slug", &slug)])
-            .send().await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Gamma API error ({status}): {body}");
-        }
-        let events: Vec<GammaEvent> = resp.json().await?;
+        retry(|| async {
+            let resp = self.http
+                .get(format!("{GAMMA_BASE}/events"))
+                .query(&[("slug", &slug)])
+                .send().await?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Gamma API error ({status}): {body}");
+            }
+            let events: Vec<GammaEvent> = resp.json().await?;
 
-        let market = events.first()
-            .and_then(|e| e.markets.first())
-            .context("Aucun marché 5min BTC actif")?;
+            let market = events.first()
+                .and_then(|e| e.markets.first())
+                .context("Aucun marché 5min BTC actif")?;
 
-        // Parse les JSON strings retournés par Gamma
-        let token_ids: Vec<String> = serde_json::from_str(&market.clob_token_ids)
-            .context("Failed to parse clobTokenIds")?;
-        let outcomes: Vec<String> = serde_json::from_str(&market.outcomes)
-            .context("Failed to parse outcomes")?;
-        anyhow::ensure!(token_ids.len() == outcomes.len(), "Token/outcome count mismatch");
+            let token_ids: Vec<String> = serde_json::from_str(&market.clob_token_ids)
+                .context("Failed to parse clobTokenIds")?;
+            let outcomes: Vec<String> = serde_json::from_str(&market.outcomes)
+                .context("Failed to parse outcomes")?;
+            anyhow::ensure!(token_ids.len() == outcomes.len(), "Token/outcome count mismatch");
 
-        let yes_idx = outcomes.iter().position(|o| o == "Up" || o == "Yes")
-            .context("Outcome 'Up'/'Yes' introuvable")?;
-        let no_idx = outcomes.iter().position(|o| o == "Down" || o == "No")
-            .context("Outcome 'Down'/'No' introuvable")?;
+            let yes_idx = outcomes.iter().position(|o| o == "Up" || o == "Yes")
+                .context("Outcome 'Up'/'Yes' introuvable")?;
+            let no_idx = outcomes.iter().position(|o| o == "Down" || o == "No")
+                .context("Outcome 'Down'/'No' introuvable")?;
 
-        Ok(Market {
-            condition_id: market.condition_id.clone(),
-            token_id_yes: token_ids[yes_idx].clone(),
-            token_id_no: token_ids[no_idx].clone(),
-            question: market.question.clone(),
-        })
+            Ok(Market {
+                condition_id: market.condition_id.clone(),
+                token_id_yes: token_ids[yes_idx].clone(),
+                token_id_no: token_ids[no_idx].clone(),
+                question: market.question.clone(),
+            })
+        }).await
     }
 
     /// Récupère le prix mid pour un token (endpoint public, pas d'auth).
     pub async fn get_midpoint(&self, token_id: &str) -> Result<f64> {
-        let resp = self.http
-            .get(format!("{CLOB_BASE}/midpoint"))
-            .query(&[("token_id", token_id)])
-            .send().await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Midpoint API error ({status}): {body}");
-        }
-        let data: MidpointResponse = resp.json().await?;
-        data.mid.parse::<f64>().context("Invalid midpoint value")
+        retry(|| async {
+            let resp = self.http
+                .get(format!("{CLOB_BASE}/midpoint"))
+                .query(&[("token_id", token_id)])
+                .send().await?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Midpoint API error ({status}): {body}");
+            }
+            let data: MidpointResponse = resp.json().await?;
+            data.mid.parse::<f64>().context("Invalid midpoint value")
+        }).await
     }
 
     /// Récupère le carnet d'ordres pour un token (endpoint public).
     pub async fn get_book(&self, token_id: &str) -> Result<BookData> {
-        let resp = self.http
-            .get(format!("{CLOB_BASE}/book"))
-            .query(&[("token_id", token_id)])
-            .send().await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Book API error ({status}): {body}");
-        }
-        let book: BookResponse = resp.json().await?;
+        retry(|| async {
+            let resp = self.http
+                .get(format!("{CLOB_BASE}/book"))
+                .query(&[("token_id", token_id)])
+                .send().await?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Book API error ({status}): {body}");
+            }
+            let book: BookResponse = resp.json().await?;
 
-        let best_bid = book.bids.iter()
-            .filter_map(|l| l.price.parse::<f64>().ok())
-            .fold(0.0_f64, f64::max);
-        let best_ask = book.asks.iter()
-            .filter_map(|l| l.price.parse::<f64>().ok())
-            .fold(1.0_f64, f64::min);
+            let best_bid = book.bids.iter()
+                .filter_map(|l| l.price.parse::<f64>().ok())
+                .fold(0.0_f64, f64::max);
+            let best_ask = book.asks.iter()
+                .filter_map(|l| l.price.parse::<f64>().ok())
+                .fold(1.0_f64, f64::min);
 
-        let bid_depth: f64 = book.bids.iter()
-            .filter_map(|l| {
-                let p = l.price.parse::<f64>().ok()?;
-                let s = l.size.parse::<f64>().ok()?;
-                Some(p * s)
-            }).sum();
-        let ask_depth: f64 = book.asks.iter()
-            .filter_map(|l| {
-                let p = l.price.parse::<f64>().ok()?;
-                let s = l.size.parse::<f64>().ok()?;
-                Some(p * s)
-            }).sum();
+            let bid_depth: f64 = book.bids.iter()
+                .filter_map(|l| {
+                    let p = l.price.parse::<f64>().ok()?;
+                    let s = l.size.parse::<f64>().ok()?;
+                    Some(p * s)
+                }).sum();
+            let ask_depth: f64 = book.asks.iter()
+                .filter_map(|l| {
+                    let p = l.price.parse::<f64>().ok()?;
+                    let s = l.size.parse::<f64>().ok()?;
+                    Some(p * s)
+                }).sum();
 
-        let total = bid_depth + ask_depth;
-        Ok(BookData {
-            best_bid,
-            best_ask,
-            spread: best_ask - best_bid,
-            bid_depth_usdc: bid_depth,
-            ask_depth_usdc: ask_depth,
-            imbalance: if total > 0.0 { bid_depth / total } else { 0.5 },
-            num_bid_levels: book.bids.len() as u32,
-            num_ask_levels: book.asks.len() as u32,
-        })
+            let total = bid_depth + ask_depth;
+            Ok(BookData {
+                best_bid,
+                best_ask,
+                spread: best_ask - best_bid,
+                bid_depth_usdc: bid_depth,
+                ask_depth_usdc: ask_depth,
+                imbalance: if total > 0.0 { bid_depth / total } else { 0.5 },
+                num_bid_levels: book.bids.len() as u32,
+                num_ask_levels: book.asks.len() as u32,
+            })
+        }).await
     }
 
     /// Récupère le fee_rate_bps pour un token (endpoint public).
     pub async fn get_fee_rate(&self, token_id: &str) -> Result<u32> {
-        let resp = self.http
-            .get(format!("{CLOB_BASE}/fee-rate"))
-            .query(&[("token_id", token_id)])
-            .send().await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Fee-rate API error ({status}): {body}");
-        }
-        let data: FeeRateResponse = resp.json().await?;
-        Ok(data.base_fee)
+        retry(|| async {
+            let resp = self.http
+                .get(format!("{CLOB_BASE}/fee-rate"))
+                .query(&[("token_id", token_id)])
+                .send().await?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Fee-rate API error ({status}): {body}");
+            }
+            let data: FeeRateResponse = resp.json().await?;
+            Ok(data.base_fee)
+        }).await
     }
 
     /// Place un ordre FOK (Fill-Or-Kill).
@@ -357,7 +388,8 @@ impl PolymarketClient {
         };
 
         let salt: u128 = rand::rng().random();
-        let expiration = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + 30;
+        let expiration_offset = if order_type == "GTC" { 120 } else { 30 };
+        let expiration = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + expiration_offset;
 
         let order = Order {
             salt: U256::from(salt),

@@ -11,7 +11,7 @@ use alloy::primitives::Address;
 use alloy::providers::ProviderBuilder;
 use anyhow::{Context, Result};
 use futures::future::select_ok;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time;
 
@@ -395,7 +395,7 @@ async fn main() -> Result<()> {
     let mut start_price = 0.0f64;
     let mut traded_this_window = false;
     let mut cached_market: Option<polymarket::Market> = None;
-    let mut pending_bet: Option<PendingBet> = None;
+    let mut pending_bet: Option<PendingBet> = load_pending_bet();
     let mut last_mid = 0.0f64;
     let mut skip_reason = String::from("startup");
     #[allow(unused_assignments)]
@@ -417,8 +417,16 @@ async fn main() -> Result<()> {
         }
     }
 
+    let mut shutdown = false;
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Ctrl+C reçu — arrêt gracieux...");
+                shutdown = true;
+                break;
+            }
+        }
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let window = (now / 300) * 300;
@@ -644,6 +652,7 @@ async fn main() -> Result<()> {
                 size_usdc: signal.size_usdc,
                 entry_price,
                 fee_pct: signal.fee_pct,
+                implied_p_up: signal.implied_p_up,
             });
             (true, "dry_run")
         } else if let Some(ref poly) = poly {
@@ -692,6 +701,13 @@ async fn main() -> Result<()> {
         traded_this_window = true;
     }
 
+    // Save pending_bet on shutdown so it can be resolved on next restart
+    if shutdown {
+        if let Some(ref bet) = pending_bet {
+            save_pending_bet(bet);
+        }
+    }
+
     // Résumé de session
     tracing::info!("=== SESSION TERMINÉE ===");
     tracing::info!("Trades: {} | Wins: {} | WR: {:.0}% | PnL: ${:.2}",
@@ -700,12 +716,40 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+#[derive(Serialize, Deserialize)]
 struct PendingBet {
     start_price: f64,
     side: polymarket::Side,
     size_usdc: f64,
     entry_price: f64,
     fee_pct: f64,
+    implied_p_up: f64,
+}
+
+const PENDING_BET_PATH: &str = "pending_bet.json";
+
+fn load_pending_bet() -> Option<PendingBet> {
+    let content = std::fs::read_to_string(PENDING_BET_PATH).ok()?;
+    let bet: PendingBet = serde_json::from_str(&content).ok()?;
+    if let Err(e) = std::fs::remove_file(PENDING_BET_PATH) {
+        tracing::warn!("Failed to remove {PENDING_BET_PATH}: {e}");
+    }
+    tracing::info!("Loaded pending bet from {PENDING_BET_PATH}: {:?} ${:.2} @ {:.4}",
+        bet.side, bet.size_usdc, bet.entry_price);
+    Some(bet)
+}
+
+fn save_pending_bet(bet: &PendingBet) {
+    match serde_json::to_string(bet) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(PENDING_BET_PATH, &json) {
+                tracing::error!("Failed to save pending bet: {e}");
+            } else {
+                tracing::info!("Saved pending bet to {PENDING_BET_PATH}");
+            }
+        }
+        Err(e) => tracing::error!("Failed to serialize pending bet: {e}"),
+    }
 }
 
 /// Resolve whether the 5-min window outcome is UP.
@@ -845,6 +889,7 @@ async fn execute_order(
             size_usdc: signal.size_usdc,
             entry_price,
             fee_pct: if pays_taker_fee { signal.fee_pct } else { 0.0 },
+            implied_p_up: signal.implied_p_up,
         }
     })
 }
@@ -879,9 +924,9 @@ fn resolve_pending_bet(
 
     // Auto-calibration: record prediction and check if recalibration is due
     let predicted_p = if bet.side == polymarket::Side::Buy {
-        1.0 - bet.entry_price
+        bet.implied_p_up
     } else {
-        bet.entry_price
+        1.0 - bet.implied_p_up
     };
     calibrator.record(predicted_p, won);
 

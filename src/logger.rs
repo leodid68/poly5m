@@ -9,10 +9,17 @@ pub struct CsvLogger {
 
 impl CsvLogger {
     pub fn new(path: &str) -> Result<Self> {
-        let file = File::create(path).context("Cannot create CSV log file")?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .context("Cannot create CSV log file")?;
+        let needs_header = file.metadata().map(|m| m.len() == 0).unwrap_or(true);
         let mut writer = BufWriter::new(file);
-        writeln!(writer, "timestamp,hour_utc,day_of_week,window,event,btc_start,btc_current,btc_resolution,price_change_pct,market_mid,implied_p_up,side,token,edge_brut_pct,edge_net_pct,fee_pct,size_usdc,entry_price,order_latency_ms,fill_type,remaining_s,num_ws_src,price_source,vol_pct,btc_1h_pct,btc_24h_pct,btc_24h_vol_m,funding_rate,spread,bid_depth,ask_depth,book_imbalance,best_bid,best_ask,mid_vs_entry_slippage_bps,bid_levels,ask_levels,micro_vol,momentum_ratio,sign_changes,max_drawdown_bps,time_above_start_s,ticks_count,result,pnl,session_pnl,session_trades,session_wr_pct,consecutive_wins,session_drawdown_pct,skip_reason")?;
-        writer.flush()?;
+        if needs_header {
+            writeln!(writer, "timestamp,hour_utc,day_of_week,window,event,btc_start,btc_current,btc_resolution,price_change_pct,market_mid,implied_p_up,side,token,edge_brut_pct,edge_net_pct,fee_pct,size_usdc,entry_price,order_latency_ms,fill_type,remaining_s,num_ws_src,price_source,vol_pct,btc_1h_pct,btc_24h_pct,btc_24h_vol_m,funding_rate,spread,bid_depth,ask_depth,book_imbalance,best_bid,best_ask,mid_vs_entry_slippage_bps,bid_levels,ask_levels,micro_vol,momentum_ratio,sign_changes,max_drawdown_bps,time_above_start_s,ticks_count,result,pnl,session_pnl,session_trades,session_wr_pct,consecutive_wins,session_drawdown_pct,skip_reason")?;
+            writer.flush()?;
+        }
         Ok(Self { writer })
     }
 
@@ -143,7 +150,7 @@ impl CsvLogger {
             self.writer,
             "{timestamp},{hour_utc},{day_of_week},{window},skip,\
              {btc_start:.2},{btc_end:.2},,{change_pct:.4},\
-             {market_mid:.4},,{reason},\
+             {market_mid:.4},,,\
              ,,,,,,,,,{num_ws},{price_source},\
              {vol_pct:.4},{:.4},{:.4},{:.1},{:.8},\
              ,,,,,,,,,,,,,,,\
@@ -429,6 +436,61 @@ mod tests {
         assert!(lines[1].contains("RTDS"));
         assert!(lines[2].contains("WS"));
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn csv_logger_appends_without_duplicate_header() {
+        let path = "/tmp/poly5m_test_csv_append.csv";
+        let _ = std::fs::remove_file(path);
+        let macro_data = MacroData::default();
+        {
+            let mut logger = CsvLogger::new(path).unwrap();
+            logger.log_trade(
+                1700000000, 1699999800, 97150.0, 97155.0, 0.65, 0.62,
+                "BUY_UP", "YES", 3.5, 2.9, 0.6, 2.0, 0.65,
+                42, "FOK_filled", 10, 3, "CL", 0.12,
+                &macro_data, 0.02, 500.0, 300.0, 0.625, 0.64, 0.66,
+                5, 4, 0.001, 0.9,
+                3, 15.5, 120, 50,
+                5.50, 3, 66.7, 2, 1.25,
+            );
+        }
+        {
+            let mut logger = CsvLogger::new(path).unwrap();
+            logger.log_trade(
+                1700000300, 1700000100, 97155.0, 97160.0, 0.60, 0.58,
+                "BUY_DOWN", "NO", 2.5, 1.9, 0.5, 1.5, 0.60,
+                38, "GTC_filled", 8, 3, "WS", 0.10,
+                &macro_data, 0.01, 400.0, 250.0, 0.615, 0.59, 0.61,
+                4, 3, 0.002, 0.8,
+                2, 10.0, 100, 40,
+                4.00, 4, 75.0, 3, 0.50,
+            );
+        }
+        let content = std::fs::read_to_string(path).unwrap();
+        let lines: Vec<&str> = content.trim().lines().collect();
+        assert_eq!(lines.len(), 3, "1 header + 2 data rows, got: {lines:?}");
+        assert!(lines[0].starts_with("timestamp,"));
+        assert!(lines[1].contains("BUY_UP"));
+        assert!(lines[2].contains("BUY_DOWN"));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn csv_skip_no_reason_in_side_column() {
+        let path = "/tmp/poly5m_test_skip_side.csv";
+        let _ = std::fs::remove_file(path);
+        let macro_data = MacroData::default();
+        let mut logger = CsvLogger::new(path).unwrap();
+        logger.log_skip(1700000000, 1699999800, 97150.50, 97160.0, 0.95, 3, "CL", 0.12, &macro_data, "mid>0.90");
+        drop(logger);
+        let content = std::fs::read_to_string(path).unwrap();
+        let lines: Vec<&str> = content.trim().lines().collect();
+        let fields: Vec<&str> = lines[1].split(',').collect();
+        // side column (index 11) should be empty, skip_reason (index 50) should have the reason
+        assert_eq!(fields[11], "", "side column should be empty for skips, got: {}", fields[11]);
+        assert_eq!(fields[50], "mid>0.90", "skip_reason should contain reason");
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

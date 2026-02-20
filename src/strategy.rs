@@ -619,7 +619,8 @@ fn price_change_to_probability(pct_change: f64, seconds_remaining: u64, vol_5min
 
     let z = pct_change / remaining_vol;
     let imbalance_signal = (book_imbalance - 0.5).clamp(-0.4, 0.4);
-    let z_combined = z * 0.6 + imbalance_signal * z.signum() * 2.5;
+    let z_weight = (z.abs() * 10.0).min(1.0);
+    let z_combined = z * 0.6 + imbalance_signal * 2.5 * z_weight;
 
     if student_t_df > 0.0 {
         use statrs::distribution::{StudentsT, ContinuousCDF};
@@ -1825,6 +1826,18 @@ mod tests {
     fn hybrid_neutral_imbalance_close_to_original() {
         let p = price_change_to_probability(0.05, 10, 0.12, 1.0, 0.5, 0.0);
         assert!(p > 0.5, "UP move with neutral imbalance should still lean UP: {p}");
+    }
+
+    #[test]
+    fn hybrid_z_near_zero_muted() {
+        // When z ≈ 0 (flat price), imbalance should NOT push probability far from 0.5
+        let p_bullish_book = price_change_to_probability(0.0001, 10, 0.12, 1.0, 0.9, 0.0);
+        let p_bearish_book = price_change_to_probability(0.0001, 10, 0.12, 1.0, 0.1, 0.0);
+        // Both should be close to 0.5 since price is essentially flat
+        assert!((p_bullish_book - 0.5).abs() < 0.15,
+            "near-zero z with bullish book should stay near 0.5: {p_bullish_book}");
+        assert!((p_bearish_book - 0.5).abs() < 0.15,
+            "near-zero z with bearish book should stay near 0.5: {p_bearish_book}");
     }
 
     #[test]
