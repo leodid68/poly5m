@@ -26,6 +26,7 @@ pub struct StrategyConfig {
     pub min_ws_sources: u32,
     pub circuit_breaker_window: usize,
     pub circuit_breaker_min_wr: f64,
+    pub circuit_breaker_cooldown_s: u64,
 }
 
 /// Signal de trade émis par la stratégie.
@@ -148,7 +149,7 @@ impl VolTracker {
         }
         let n = self.recent_moves.len() as f64;
         let mean = self.recent_moves.iter().sum::<f64>() / n;
-        let variance = self.recent_moves.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+        let variance = self.recent_moves.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
         variance.sqrt().clamp(0.01, 1.0)
     }
 }
@@ -274,7 +275,7 @@ pub fn evaluate(
     // Cohérence Chainlink / exchanges — skip si divergence directionnelle
     if let Some(ex_price) = ctx.exchange_price {
         let cl_move_pct = ((ctx.chainlink_price - ctx.start_price) / ctx.start_price).abs();
-        if cl_move_pct > 0.00001 {
+        if cl_move_pct > 0.0001 {
             let chainlink_up = ctx.chainlink_price > ctx.start_price;
             let exchange_up = ex_price > ctx.start_price;
             if chainlink_up != exchange_up {
@@ -347,8 +348,10 @@ pub fn evaluate(
 }
 
 /// Calcule les frais dynamiques Polymarket.
-/// fee_rate = 0.25 pour les marchés crypto 5min/15min, exponent = 2.
-/// Retourne le fee en fraction du coût (price).
+/// Official formula: fee = C × p × feeRate × [p(1-p)]^exponent.
+/// For crypto 5min/15min: feeRate = 0.25, exponent = 2.
+/// Returns fee as fraction of cost (per dollar invested = fee / (C×p) = feeRate × [p(1-p)]^2).
+/// Max fee: 1.56% at p=0.50, drops to ~0% at extremes.
 pub fn dynamic_fee(price: f64, fee_rate: f64) -> f64 {
     let p_q = price * (1.0 - price);
     fee_rate * p_q.powi(2)
@@ -425,6 +428,7 @@ mod tests {
             min_ws_sources: 0,
             circuit_breaker_window: 0,
             circuit_breaker_min_wr: 0.0,
+            circuit_breaker_cooldown_s: 1800,
         }
     }
 
@@ -1019,6 +1023,7 @@ mod tests {
             min_ws_sources: 3,
             circuit_breaker_window: 15,
             circuit_breaker_min_wr: 0.25,
+            circuit_breaker_cooldown_s: 1800,
         }
     }
 

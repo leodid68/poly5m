@@ -136,6 +136,8 @@ struct StrategyToml {
     circuit_breaker_window: usize,
     #[serde(default)]
     circuit_breaker_min_wr: f64,
+    #[serde(default = "default_circuit_breaker_cooldown")]
+    circuit_breaker_cooldown_s: u64,
 }
 
 fn default_min_bet_usdc() -> f64 { 1.0 }
@@ -153,6 +155,7 @@ fn default_kelly_fraction() -> f64 { 0.25 }
 fn default_initial_bankroll() -> f64 { 40.0 }
 fn default_vol_confidence_multiplier() -> f64 { 1.0 }
 fn default_circuit_breaker_window() -> usize { 0 }
+fn default_circuit_breaker_cooldown() -> u64 { 1800 }
 
 impl From<StrategyToml> for strategy::StrategyConfig {
     fn from(s: StrategyToml) -> Self {
@@ -179,13 +182,22 @@ impl From<StrategyToml> for strategy::StrategyConfig {
             min_ws_sources: s.min_ws_sources,
             circuit_breaker_window: s.circuit_breaker_window,
             circuit_breaker_min_wr: s.circuit_breaker_min_wr,
+            circuit_breaker_cooldown_s: s.circuit_breaker_cooldown_s,
         }
     }
 }
 
 fn load_config() -> Result<Config> {
     let text = std::fs::read_to_string("config.toml").context("config.toml introuvable")?;
-    toml::from_str(&text).context("Erreur de parsing config.toml")
+    let mut config: Config = toml::from_str(&text).context("Erreur de parsing config.toml")?;
+
+    // Override secrets from environment variables (takes precedence over config.toml)
+    if let Ok(v) = std::env::var("POLY_API_KEY") { config.polymarket.api_key = v; }
+    if let Ok(v) = std::env::var("POLY_API_SECRET") { config.polymarket.api_secret = v; }
+    if let Ok(v) = std::env::var("POLY_PASSPHRASE") { config.polymarket.passphrase = v; }
+    if let Ok(v) = std::env::var("POLY_PRIVATE_KEY") { config.polymarket.private_key = v; }
+
+    Ok(config)
 }
 
 // --- Main ---
@@ -299,14 +311,6 @@ async fn main() -> Result<()> {
     let mut start_price = 0.0f64;
     let mut traded_this_window = false;
     let mut cached_market: Option<polymarket::Market> = None;
-    struct PendingBet {
-        start_price: f64,
-        side: polymarket::Side,
-        size_usdc: f64,
-        entry_price: f64,
-        fee_pct: f64,
-    }
-
     let mut pending_bet: Option<PendingBet> = None;
     let mut last_mid = 0.0f64;
     let mut skip_reason = String::from("startup");
@@ -374,7 +378,7 @@ async fn main() -> Result<()> {
                 session.check_circuit_breaker(
                     strat_config.circuit_breaker_window,
                     strat_config.circuit_breaker_min_wr,
-                    1800, // 30 min cooldown
+                    strat_config.circuit_breaker_cooldown_s,
                     now,
                 );
             }
@@ -482,26 +486,12 @@ async fn main() -> Result<()> {
         let signal = match strategy::evaluate(&ctx, &session, &strat_config) {
             Some(s) => s,
             None => {
-                // Track skip reason pour le CSV
                 let price_change_pct = ((current_btc - start_price) / start_price * 100.0).abs();
-                let vol = vol_tracker.current_vol();
-                if strat_config.min_ws_sources > 0 && u32::from(num_ws) < strat_config.min_ws_sources {
-                    skip_reason = format!("ws_src<{}", strat_config.min_ws_sources);
-                } else if strat_config.max_vol_5min_pct > 0.0 && vol > strat_config.max_vol_5min_pct {
-                    skip_reason = format!("vol>{:.3}%", strat_config.max_vol_5min_pct);
-                } else if market_up_price < strat_config.min_market_price {
-                    skip_reason = format!("mid<{:.2}", strat_config.min_market_price);
-                } else if market_up_price > strat_config.max_market_price {
-                    skip_reason = format!("mid>{:.2}", strat_config.max_market_price);
-                } else if strat_config.min_book_imbalance > 0.0 && spread_book.imbalance < strat_config.min_book_imbalance {
-                    skip_reason = format!("imbal<{:.2}", strat_config.min_book_imbalance);
-                } else if strat_config.min_delta_pct > 0.0 && price_change_pct < strat_config.min_delta_pct {
-                    skip_reason = format!("delta<{:.4}%", strat_config.min_delta_pct);
-                } else if strat_config.max_spread > 0.0 && spread_book.spread > strat_config.max_spread {
-                    skip_reason = format!("spread>{:.2}", strat_config.max_spread);
-                } else {
-                    skip_reason = String::from("no_edge");
-                }
+                skip_reason = infer_skip_reason(
+                    &strat_config, market_up_price, price_change_pct,
+                    vol_tracker.current_vol(), num_ws, spread_book.spread,
+                    spread_book.imbalance, ws_price, cl_price, start_price,
+                );
                 continue;
             }
         };
@@ -557,68 +547,18 @@ async fn main() -> Result<()> {
             });
             traded_this_window = true;
         } else if let Some(ref poly) = poly {
-            let order_t = Instant::now();
-            let order_result = if order_type == "GTC" {
-                // Maker order: place GTC, wait for fill, cancel if timeout
-                match poly.place_limit_order(token_id, polymarket::Side::Buy, signal.size_usdc, entry_price, fee_rate_bps).await {
-                    Ok(result) => {
-                        let order_ms = order_t.elapsed().as_millis();
-                        tracing::info!("[MAKER] Ordre GTC placé: {} en {}ms", result.order_id, order_ms);
-                        if result.status == "matched" {
-                            // Immediately filled (crossed the book)
-                            Some(result)
-                        } else {
-                            // Wait for fill, then check status
-                            tokio::time::sleep(Duration::from_secs(maker_timeout_s)).await;
-                            let filled = match poly.get_order_status(&result.order_id).await {
-                                Ok(status) => {
-                                    tracing::info!("[MAKER] Order {} status after {}s: {}", result.order_id, maker_timeout_s, status);
-                                    status == "matched"
-                                }
-                                Err(e) => {
-                                    tracing::warn!("[MAKER] Status check failed: {e:#}");
-                                    false
-                                }
-                            };
-                            if filled {
-                                Some(result)
-                            } else {
-                                tracing::info!("[MAKER] Not filled — cancelling {}", result.order_id);
-                                if let Err(e) = poly.cancel_order(&result.order_id).await {
-                                    tracing::warn!("[MAKER] Cancel failed: {e:#}");
-                                }
-                                None
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Erreur ordre GTC: {e:#} ({}ms)", order_t.elapsed().as_millis());
-                        None
-                    }
-                }
+            if let Some(bet) = execute_order(
+                poly, token_id, &signal, entry_price, start_price,
+                fee_rate_bps, &order_type, maker_timeout_s,
+            ).await {
+                pending_bet = Some(bet);
             } else {
-                // Taker order: FOK (existing behavior)
-                match poly.place_order(token_id, polymarket::Side::Buy, signal.size_usdc, entry_price, fee_rate_bps).await {
-                    Ok(result) => {
-                        let order_ms = order_t.elapsed().as_millis();
-                        tracing::info!("Ordre FOK: {} (status: {}) en {}ms", result.order_id, result.status, order_ms);
-                        if result.status == "matched" { Some(result) } else { None }
-                    }
-                    Err(e) => {
-                        tracing::error!("Erreur ordre FOK: {e:#} ({}ms)", order_t.elapsed().as_millis());
-                        None
-                    }
+                let reason = if order_type == "GTC" { "gtc_not_filled" } else { "fok_rejected" };
+                tracing::warn!("Ordre {reason} — loggé comme skip");
+                if let Some(ref mut csv) = csv {
+                    csv.log_skip(now, current_window, start_price, current_btc,
+                        market_up_price, num_ws, vol_tracker.current_vol(), &macro_ctx, reason);
                 }
-            };
-
-            if order_result.is_some() {
-                pending_bet = Some(PendingBet {
-                    start_price,
-                    side: signal.side,
-                    size_usdc: signal.size_usdc,
-                    entry_price,
-                    fee_pct: if order_type == "GTC" { 0.0 } else { signal.fee_pct },
-                });
             }
             traded_this_window = true;
         }
@@ -630,6 +570,14 @@ async fn main() -> Result<()> {
         session.trades, session.wins, session.win_rate() * 100.0, session.pnl_usdc);
 
     Ok(())
+}
+
+struct PendingBet {
+    start_price: f64,
+    side: polymarket::Side,
+    size_usdc: f64,
+    entry_price: f64,
+    fee_pct: f64,
 }
 
 /// Resolve whether the 5-min window outcome is UP.
@@ -648,9 +596,131 @@ fn compute_pnl(won: bool, size: f64, price: f64, fee_pct: f64) -> f64 {
     }
 }
 
+/// Infer why evaluate() returned None (mirrors evaluate() filter order for CSV logging).
+#[allow(clippy::too_many_arguments)]
+fn infer_skip_reason(
+    config: &strategy::StrategyConfig,
+    market_up_price: f64,
+    price_change_pct: f64,
+    vol: f64,
+    num_ws: u8,
+    spread: f64,
+    imbalance: f64,
+    ws_price: Option<f64>,
+    cl_price: Option<f64>,
+    start_price: f64,
+) -> String {
+    if config.min_ws_sources > 0 && u32::from(num_ws) < config.min_ws_sources {
+        format!("ws_src<{}", config.min_ws_sources)
+    } else if config.max_vol_5min_pct > 0.0 && vol > config.max_vol_5min_pct {
+        format!("vol>{:.3}%", config.max_vol_5min_pct)
+    } else if market_up_price < config.min_market_price {
+        format!("mid<{:.2}", config.min_market_price)
+    } else if market_up_price > config.max_market_price {
+        format!("mid>{:.2}", config.max_market_price)
+    } else if config.min_payout_ratio > 0.0 && {
+        let mp = if price_change_pct >= 0.0 { market_up_price } else { 1.0 - market_up_price };
+        (1.0 - mp) / mp < config.min_payout_ratio
+    } {
+        format!("payout<{:.2}", config.min_payout_ratio)
+    } else if config.min_book_imbalance > 0.0 && imbalance < config.min_book_imbalance {
+        format!("imbal<{:.2}", config.min_book_imbalance)
+    } else if ws_price.is_some() && cl_price.is_some() && {
+        let cl = cl_price.unwrap();
+        let cl_move = ((cl - start_price) / start_price).abs();
+        cl_move > 0.0001 && (cl > start_price) != (ws_price.unwrap() > start_price)
+    } {
+        String::from("divergence")
+    } else if config.min_delta_pct > 0.0 && price_change_pct < config.min_delta_pct {
+        format!("delta<{:.4}%", config.min_delta_pct)
+    } else if config.max_spread > 0.0 && spread > config.max_spread {
+        format!("spread>{:.2}", config.max_spread)
+    } else {
+        String::from("no_edge")
+    }
+}
+
+/// Execute a FOK or GTC order via the Polymarket API.
+/// Returns Some(PendingBet) if the order was filled, None if it failed or wasn't filled.
+#[allow(clippy::too_many_arguments)]
+async fn execute_order(
+    poly: &polymarket::PolymarketClient,
+    token_id: &str,
+    signal: &strategy::Signal,
+    entry_price: f64,
+    start_price: f64,
+    fee_rate_bps: u32,
+    order_type: &str,
+    maker_timeout_s: u64,
+) -> Option<PendingBet> {
+    let order_t = Instant::now();
+    let mut gtc_immediate_fill = false;
+
+    let order_result = if order_type == "GTC" {
+        match poly.place_limit_order(token_id, polymarket::Side::Buy, signal.size_usdc, entry_price, fee_rate_bps).await {
+            Ok(result) => {
+                let order_ms = order_t.elapsed().as_millis();
+                tracing::info!("[MAKER] Ordre GTC placé: {} en {}ms", result.order_id, order_ms);
+                if result.status == "matched" {
+                    gtc_immediate_fill = true;
+                    Some(result)
+                } else {
+                    tokio::time::sleep(Duration::from_secs(maker_timeout_s)).await;
+                    let filled = match poly.get_order_status(&result.order_id).await {
+                        Ok(status) => {
+                            tracing::info!("[MAKER] Order {} status after {}s: {}", result.order_id, maker_timeout_s, status);
+                            status == "matched"
+                        }
+                        Err(e) => {
+                            tracing::warn!("[MAKER] Status check failed: {e:#}");
+                            false
+                        }
+                    };
+                    if filled {
+                        Some(result)
+                    } else {
+                        tracing::info!("[MAKER] Not filled — cancelling {}", result.order_id);
+                        if let Err(e) = poly.cancel_order(&result.order_id).await {
+                            tracing::warn!("[MAKER] Cancel failed: {e:#}");
+                        }
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("Erreur ordre GTC: {e:#} ({}ms)", order_t.elapsed().as_millis());
+                None
+            }
+        }
+    } else {
+        match poly.place_order(token_id, polymarket::Side::Buy, signal.size_usdc, entry_price, fee_rate_bps).await {
+            Ok(result) => {
+                let order_ms = order_t.elapsed().as_millis();
+                tracing::info!("Ordre FOK: {} (status: {}) en {}ms", result.order_id, result.status, order_ms);
+                if result.status == "matched" { Some(result) } else { None }
+            }
+            Err(e) => {
+                tracing::error!("Erreur ordre FOK: {e:#} ({}ms)", order_t.elapsed().as_millis());
+                None
+            }
+        }
+    };
+
+    order_result.map(|_| {
+        let pays_taker_fee = order_type != "GTC" || gtc_immediate_fill;
+        PendingBet {
+            start_price,
+            side: signal.side,
+            size_usdc: signal.size_usdc,
+            entry_price,
+            fee_pct: if pays_taker_fee { signal.fee_pct } else { 0.0 },
+        }
+    })
+}
+
 /// Fetch prix Chainlink en RACING parallèle — prend la 1ère réponse.
 async fn fetch_racing(
-    providers: &[impl alloy::providers::Provider + Sync],
+    providers: &[impl alloy::providers::Provider],
     feed: Address,
 ) -> Result<chainlink::PriceData> {
     if providers.len() == 1 {
@@ -702,5 +772,23 @@ mod tests {
         let pnl = compute_pnl(false, size, price, fee_pct);
         let expected = -size - size * 0.0052;
         assert!((pnl - expected).abs() < 1e-10, "loss pnl should be -size-fee, got {pnl}");
+    }
+
+    #[test]
+    fn pnl_win_zero_fee_maker() {
+        // GTC maker case: fee_pct = 0.0
+        let size = 2.0;
+        let price = 0.65;
+        let pnl = compute_pnl(true, size, price, 0.0);
+        let expected = size * (1.0 / price - 1.0); // ~1.077
+        assert!((pnl - expected).abs() < 1e-10, "pnl={pnl} expected={expected}");
+    }
+
+    #[test]
+    fn pnl_loss_zero_fee_maker() {
+        // GTC maker case: fee_pct = 0.0
+        let size = 2.0;
+        let pnl = compute_pnl(false, size, 0.65, 0.0);
+        assert!((pnl - (-size)).abs() < 1e-10, "loss pnl should be -size, got {pnl}");
     }
 }

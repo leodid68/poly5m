@@ -29,7 +29,7 @@ pub struct PriceData {
 /// Lit le dernier prix BTC/USD depuis Chainlink.
 /// Le provider est créé dans main.rs — ici on reste agnostique du transport.
 pub async fn fetch_price(
-    provider: &(impl Provider + Sync),
+    provider: &impl Provider,
     feed: Address,
 ) -> Result<PriceData> {
     let tx = TransactionRequest::default()

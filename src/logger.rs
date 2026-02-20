@@ -55,6 +55,7 @@ impl CsvLogger {
     }
 
     /// Log quand un bet est résolu (win/loss).
+    #[allow(clippy::too_many_arguments)]
     pub fn log_resolution(
         &mut self,
         timestamp: u64,
@@ -70,13 +71,14 @@ impl CsvLogger {
         let change_pct = if btc_start > 0.0 { (btc_resolution - btc_start) / btc_start * 100.0 } else { 0.0 };
         if let Err(e) = writeln!(
             self.writer,
-            "{timestamp},{window},resolution,{btc_start:.2},,{btc_resolution:.2},{change_pct:.4},,,,,,,,,,,,,,,,,,,,,{result},{pnl:.4},{session_pnl:.4},{session_trades},{session_wr:.1}"
+            "{timestamp},{window},resolution,{btc_start:.2},,{btc_resolution:.2},{change_pct:.4},,,,,,,,,,,,,,,,,,,,,,,{result},{pnl:.4},{session_pnl:.4},{session_trades},{session_wr:.1}"
         ).and_then(|_| self.writer.flush()) {
             tracing::warn!("CSV write error: {e}");
         }
     }
 
     /// Log résumé de window sans trade (pour analyse des skips).
+    #[allow(clippy::too_many_arguments)]
     pub fn log_skip(
         &mut self,
         timestamp: u64,
@@ -92,7 +94,7 @@ impl CsvLogger {
         let change_pct = if btc_start > 0.0 { (btc_end - btc_start) / btc_start * 100.0 } else { 0.0 };
         if let Err(e) = writeln!(
             self.writer,
-            "{timestamp},{window},skip,{btc_start:.2},{btc_end:.2},,{change_pct:.4},{market_mid:.4},,{reason},,,,,,,,{num_ws},{vol_pct:.4},{:.4},{:.4},{:.1},{:.8},,,,,,,,,,",
+            "{timestamp},{window},skip,{btc_start:.2},{btc_end:.2},,{change_pct:.4},{market_mid:.4},,{reason},,,,,,,,{num_ws},{vol_pct:.4},{:.4},{:.4},{:.1},{:.8},,,,,,,,,,,",
             macro_data.btc_1h_pct, macro_data.btc_24h_pct, macro_data.btc_24h_vol_m, macro_data.funding_rate,
         ).and_then(|_| self.writer.flush()) {
             tracing::warn!("CSV write error: {e}");
@@ -159,6 +161,27 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[1].contains(",skip,"));
         assert!(lines[1].contains("mid>0.90"));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn csv_all_events_same_field_count() {
+        let path = "/tmp/poly5m_test_alignment.csv";
+        let mut logger = CsvLogger::new(path).unwrap();
+        let macro_data = MacroData::default();
+        logger.log_trade(1700000000, 1699999800, 97150.0, 97155.0, 0.65, 0.62,
+            "BUY_UP", "YES", 3.5, 2.9, 0.6, 2.0, 0.65, 10, 3, 0.12,
+            &macro_data, 0.02, 500.0, 300.0, 0.625, 5, 4);
+        logger.log_resolution(1700000300, 1699999800, 97150.0, 97200.0, "WIN", 1.08, 5.50, 3, 66.7);
+        logger.log_skip(1700000000, 1699999800, 97150.0, 97160.0, 0.95, 3, 0.12, &macro_data, "test");
+        drop(logger);
+
+        let content = std::fs::read_to_string(path).unwrap();
+        for (i, line) in content.trim().lines().enumerate() {
+            assert_eq!(line.split(',').count(), 34,
+                "Line {} has {} fields instead of 34: {}",
+                i, line.split(',').count(), &line[..line.len().min(60)]);
+        }
         std::fs::remove_file(path).ok();
     }
 }

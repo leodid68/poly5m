@@ -41,6 +41,7 @@ max_vol_5min_pct = 0.12
 min_ws_sources = 3
 circuit_breaker_window = 15
 circuit_breaker_min_wr = 0.25
+circuit_breaker_cooldown_s = 1800
 
 [rtds]
 enabled = true
