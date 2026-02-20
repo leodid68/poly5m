@@ -3,6 +3,7 @@ mod exchanges;
 mod logger;
 mod macro_data;
 mod polymarket;
+mod presets;
 mod rtds;
 mod strategy;
 
@@ -138,6 +139,10 @@ struct StrategyToml {
     circuit_breaker_min_wr: f64,
     #[serde(default = "default_circuit_breaker_cooldown")]
     circuit_breaker_cooldown_s: u64,
+    #[serde(default)]
+    min_implied_prob: f64,
+    #[serde(default)]
+    max_consecutive_losses: u32,
 }
 
 fn default_min_bet_usdc() -> f64 { 1.0 }
@@ -183,6 +188,8 @@ impl From<StrategyToml> for strategy::StrategyConfig {
             circuit_breaker_window: s.circuit_breaker_window,
             circuit_breaker_min_wr: s.circuit_breaker_min_wr,
             circuit_breaker_cooldown_s: s.circuit_breaker_cooldown_s,
+            min_implied_prob: s.min_implied_prob,
+            max_consecutive_losses: s.max_consecutive_losses,
         }
     }
 }
@@ -453,7 +460,7 @@ async fn main() -> Result<()> {
             None => {
                 let price_change_pct = ((current_btc - start_price) / start_price * 100.0).abs();
                 skip_reason = infer_skip_reason(
-                    &strat_config, market_up_price, price_change_pct,
+                    &strat_config, &session, market_up_price, price_change_pct,
                     vol_tracker.current_vol(), num_ws, spread_book.spread,
                     spread_book.imbalance, ws_price, cl_price, start_price,
                 );
@@ -565,6 +572,7 @@ fn compute_pnl(won: bool, size: f64, price: f64, fee_pct: f64) -> f64 {
 #[allow(clippy::too_many_arguments)]
 fn infer_skip_reason(
     config: &strategy::StrategyConfig,
+    session: &strategy::Session,
     market_up_price: f64,
     price_change_pct: f64,
     vol: f64,
@@ -575,7 +583,9 @@ fn infer_skip_reason(
     cl_price: Option<f64>,
     start_price: f64,
 ) -> String {
-    if config.min_ws_sources > 0 && u32::from(num_ws) < config.min_ws_sources {
+    if config.max_consecutive_losses > 0 && session.consecutive_losses >= config.max_consecutive_losses {
+        format!("consec_loss>={}", config.max_consecutive_losses)
+    } else if config.min_ws_sources > 0 && u32::from(num_ws) < config.min_ws_sources {
         format!("ws_src<{}", config.min_ws_sources)
     } else if config.max_vol_5min_pct > 0.0 && vol > config.max_vol_5min_pct {
         format!("vol>{:.3}%", config.max_vol_5min_pct)
