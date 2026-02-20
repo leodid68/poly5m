@@ -449,18 +449,32 @@ async fn main() -> Result<()> {
             Err(_) => None,
         };
 
-        // Fenêtre d'entrée : fetch marché (cache) + midpoint + fee rate
-        let (market, market_up_price, fee_rate_bps) = if let Some(ref poly) = poly {
+        // Fenêtre d'entrée : fetch marché + midpoint + book + fee rate (parallèle)
+        let market_data = if let Some(ref poly) = poly {
             match fetch_market_data(poly, &mut cached_market, current_window, default_fee_rate_bps).await {
-                Ok(data) => (Some(data.market), data.mid_price, data.fee_rate_bps),
+                Ok(data) => data,
                 Err(reason) => {
                     skip_reason = reason;
                     continue;
                 }
             }
         } else {
-            (None, 0.50, default_fee_rate_bps)
+            MarketData {
+                market: polymarket::Market {
+                    condition_id: String::new(),
+                    token_id_yes: String::new(),
+                    token_id_no: String::new(),
+                    question: String::new(),
+                },
+                mid_price: 0.50,
+                fee_rate_bps: default_fee_rate_bps,
+                book: polymarket::BookData::default(),
+            }
         };
+
+        let market_up_price = market_data.mid_price;
+        let fee_rate_bps = market_data.fee_rate_bps;
+        let spread_book = market_data.book;
 
         last_mid = market_up_price;
 
@@ -468,14 +482,6 @@ async fn main() -> Result<()> {
             "Fee check: API bps={} | calc={:.4}% | mid={:.4}",
             fee_rate_bps, strategy::dynamic_fee(market_up_price, strat_config.fee_rate) * 100.0, market_up_price
         );
-
-        // Fetch book for spread (before evaluate) — always YES token
-        let spread_book = if let Some(ref poly) = poly {
-            let token = cached_market.as_ref().map(|m| m.token_id_yes.as_str()).unwrap_or("0");
-            poly.get_book(token).await.unwrap_or_default()
-        } else {
-            polymarket::BookData::default()
-        };
 
         // evaluate() : RTDS for probability model (settlement price), CL/WS for divergence
         let ctx = strategy::TradeContext {
@@ -504,11 +510,10 @@ async fn main() -> Result<()> {
             }
         };
 
-        let dummy_token = "dry-run-token".to_string();
-        let (token_id, token_label) = match &market {
-            Some(m) if signal.side == polymarket::Side::Buy => (&m.token_id_yes, "YES"),
-            Some(m) => (&m.token_id_no, "NO"),
-            None => (&dummy_token, "YES"),
+        let (token_id, token_label) = if signal.side == polymarket::Side::Buy {
+            (&market_data.market.token_id_yes, "YES")
+        } else {
+            (&market_data.market.token_id_no, "NO")
         };
 
         // Reuse spread_book if trading YES token, otherwise fetch NO token book
@@ -765,9 +770,11 @@ struct MarketData {
     market: polymarket::Market,
     mid_price: f64,
     fee_rate_bps: u32,
+    book: polymarket::BookData,
 }
 
-/// Fetch market, midpoint, and fee rate from Polymarket (with cache).
+/// Fetch market, midpoint, book, and fee rate from Polymarket (with cache).
+/// Midpoint, book, and fee rate are fetched concurrently via `tokio::join!`.
 async fn fetch_market_data(
     poly: &polymarket::PolymarketClient,
     cached_market: &mut Option<polymarket::Market>,
@@ -784,19 +791,30 @@ async fn fetch_market_data(
         }
     }
     let market = cached_market.as_ref().unwrap();
-    let mid = match poly.get_midpoint(&market.token_id_yes).await {
+    let token = market.token_id_yes.as_str();
+
+    // Parallel fetch: midpoint + book + fee rate
+    let (mid_res, book_res, fee_res) = tokio::join!(
+        poly.get_midpoint(token),
+        poly.get_book(token),
+        poly.get_fee_rate(token),
+    );
+
+    let mid = match mid_res {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!("Midpoint error: {e:#}");
             return Err(format!("midpoint_err:{e}"));
         }
     };
-    let fee = poly.get_fee_rate(&market.token_id_yes).await
-        .unwrap_or(default_fee_rate_bps);
+    let book = book_res.unwrap_or_default();
+    let fee = fee_res.unwrap_or(default_fee_rate_bps);
+
     Ok(MarketData {
         market: market.clone(),
         mid_price: mid,
         fee_rate_bps: fee,
+        book,
     })
 }
 
