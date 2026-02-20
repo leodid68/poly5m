@@ -414,7 +414,21 @@ async fn main() -> Result<()> {
             current_window = window;
             traded_this_window = false;
             start_price = current_btc;
-            cached_market = None;
+            // Pre-fetch market for the new window (saves ~200ms during entry)
+            cached_market = if let Some(ref poly) = poly {
+                match poly.find_5min_btc_market(window).await {
+                    Ok(m) => {
+                        tracing::debug!("Pre-fetched market for window {window}: {}", m.question);
+                        Some(m)
+                    }
+                    Err(e) => {
+                        tracing::debug!("Pre-fetch failed (will retry): {e:#}");
+                        None // fetch_market_data() will retry during entry window
+                    }
+                }
+            } else {
+                None
+            };
             last_mid = 0.0;
             skip_reason = String::from("no_entry");
             macro_ctx = macro_data::fetch(&macro_http).await;
