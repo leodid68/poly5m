@@ -228,6 +228,83 @@ impl WindowTicks {
     }
 }
 
+/// Auto-calibration: tracks (predicted_prob, actual_outcome) pairs and
+/// recalibrates vol_confidence_multiplier by minimizing Brier Score.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct Calibrator {
+    entries: Vec<(f64, bool)>,
+    recalibrate_every: usize,
+}
+
+#[allow(dead_code)]
+impl Calibrator {
+    pub fn new(recalibrate_every: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(recalibrate_every + 10),
+            recalibrate_every,
+        }
+    }
+
+    pub fn record(&mut self, predicted_prob: f64, won: bool) {
+        self.entries.push((predicted_prob, won));
+    }
+
+    pub fn count(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn should_recalibrate(&self) -> bool {
+        self.recalibrate_every > 0 && self.entries.len() >= self.recalibrate_every
+    }
+
+    /// Brier Score on current entries.
+    pub fn brier_score(&self) -> f64 {
+        if self.entries.is_empty() {
+            return 1.0;
+        }
+        let sum: f64 = self.entries.iter()
+            .map(|(p, won)| {
+                let outcome = if *won { 1.0 } else { 0.0 };
+                (p - outcome).powi(2)
+            })
+            .sum();
+        sum / self.entries.len() as f64
+    }
+
+    /// Grid-search the optimal vol_confidence_multiplier that minimizes Brier Score.
+    /// Returns Some((optimal_multiplier, brier_score)) and clears entries.
+    /// Returns None if not enough data.
+    pub fn recalibrate(&mut self) -> Option<(f64, f64)> {
+        if self.entries.is_empty() {
+            return None;
+        }
+
+        let multipliers: Vec<f64> = (2..=16).map(|i| i as f64 * 0.5).collect();
+        let mut best_mult = 4.0;
+        let mut best_brier = f64::MAX;
+
+        for &mult in &multipliers {
+            let brier: f64 = self.entries.iter()
+                .map(|(p, won)| {
+                    let adjusted_p = 0.5 + (*p - 0.5) * (4.0 / mult);
+                    let adjusted_p = adjusted_p.clamp(0.001, 0.999);
+                    let outcome = if *won { 1.0 } else { 0.0 };
+                    (adjusted_p - outcome).powi(2)
+                })
+                .sum::<f64>() / self.entries.len() as f64;
+
+            if brier < best_brier {
+                best_brier = brier;
+                best_mult = mult;
+            }
+        }
+
+        self.entries.clear();
+        Some((best_mult, best_brier))
+    }
+}
+
 /// Market context for trade evaluation.
 #[derive(Debug, Clone)]
 pub struct TradeContext {
@@ -1744,5 +1821,72 @@ mod tests {
         wt.tick(100.0);
         assert!(wt.micro_vol() == 0.0);
         assert!(wt.momentum_ratio() == 1.0);
+    }
+
+    // --- Calibrator ---
+
+    #[test]
+    fn calibrator_records_and_counts() {
+        let mut cal = Calibrator::new(5);
+        cal.record(0.8, true);
+        cal.record(0.6, false);
+        cal.record(0.9, true);
+        assert_eq!(cal.count(), 3);
+        assert!(!cal.should_recalibrate());
+    }
+
+    #[test]
+    fn calibrator_triggers_at_threshold() {
+        let mut cal = Calibrator::new(5);
+        for i in 0..5 {
+            cal.record(0.7, i % 2 == 0);
+        }
+        assert!(cal.should_recalibrate());
+    }
+
+    #[test]
+    fn calibrator_brier_score() {
+        let mut cal = Calibrator::new(10);
+        cal.record(1.0, true);
+        cal.record(0.0, false);
+        let bs = cal.brier_score();
+        assert!(bs < 0.01, "perfect predictions should have low brier: {bs}");
+    }
+
+    #[test]
+    fn calibrator_brier_score_bad() {
+        let mut cal = Calibrator::new(10);
+        for _ in 0..5 {
+            cal.record(0.9, false);
+        }
+        let bs = cal.brier_score();
+        assert!(bs > 0.5, "bad predictions should have high brier: {bs}");
+    }
+
+    #[test]
+    fn calibrator_optimal_multiplier() {
+        let mut cal = Calibrator::new(5);
+        cal.record(0.9, true);
+        cal.record(0.9, false);
+        cal.record(0.9, true);
+        cal.record(0.9, false);
+        cal.record(0.9, true);
+        let result = cal.recalibrate();
+        assert!(result.is_some());
+        let (mult, brier) = result.unwrap();
+        assert!((1.0..=8.0).contains(&mult), "multiplier {mult} out of range");
+        assert!((0.0..=1.0).contains(&brier), "brier {brier} out of range");
+    }
+
+    #[test]
+    fn calibrator_resets_after_recalibrate() {
+        let mut cal = Calibrator::new(3);
+        for _ in 0..3 {
+            cal.record(0.7, true);
+        }
+        assert!(cal.should_recalibrate());
+        let _ = cal.recalibrate();
+        assert_eq!(cal.count(), 0);
+        assert!(!cal.should_recalibrate());
     }
 }
