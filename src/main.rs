@@ -270,6 +270,8 @@ async fn main() -> Result<()> {
             (strat_config, dry_run, order_type, maker_timeout_s, vol_lookback, default_vol)
         };
 
+    let mut strat_config = strat_config;
+
     // Providers Chainlink — timeouts serrés pour le racing
     let providers = config.chainlink.rpc_urls.iter()
         .map(|url| {
@@ -362,6 +364,21 @@ async fn main() -> Result<()> {
     let mut last_mid = 0.0f64;
     let mut skip_reason = String::from("startup");
     let mut macro_ctx = macro_data::MacroData::default();
+    let mut window_ticks = strategy::WindowTicks::new();
+    let mut calibrator = strategy::Calibrator::new(200);
+
+    // Load saved calibration if available (not when using a preset)
+    if profile_name.is_none() {
+        if let Ok(content) = std::fs::read_to_string("calibration.json") {
+            if let Ok(cal_data) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(mult) = cal_data["vol_confidence_multiplier"].as_f64() {
+                    tracing::info!("Loaded calibration: vcm={mult:.2} (brier={:.4})",
+                        cal_data["brier_score"].as_f64().unwrap_or(0.0));
+                    strat_config.vol_confidence_multiplier = mult;
+                }
+            }
+        }
+    }
 
     loop {
         interval.tick().await;
@@ -396,6 +413,8 @@ async fn main() -> Result<()> {
             }
         };
 
+        window_ticks.tick(current_btc);
+
         // Nouvel intervalle 5min — résoudre le bet précédent
         if window != current_window {
             // Log skip si le window précédent n'a pas donné de trade
@@ -407,7 +426,7 @@ async fn main() -> Result<()> {
 
             if let Some(bet) = pending_bet.take() {
                 resolve_pending_bet(bet, current_btc, now, current_window,
-                    &mut session, &mut csv, &strat_config);
+                    &mut session, &mut csv, &mut strat_config, &mut calibrator);
             }
 
             // Enregistrer le mouvement de l'intervalle précédent pour la vol dynamique
@@ -418,6 +437,7 @@ async fn main() -> Result<()> {
             current_window = window;
             traded_this_window = false;
             start_price = current_btc;
+            window_ticks.clear();
             // Pre-fetch market for the new window (saves ~200ms during entry)
             cached_market = if let Some(ref poly) = poly {
                 match poly.find_5min_btc_market(window).await {
@@ -514,6 +534,8 @@ async fn main() -> Result<()> {
             spread: spread_book.spread,
             book_imbalance: spread_book.imbalance,
             num_ws_sources: u32::from(num_ws),
+            micro_vol: window_ticks.micro_vol(),
+            momentum_ratio: window_ticks.momentum_ratio(),
         };
         let signal = match strategy::evaluate(&ctx, &session, &strat_config) {
             Some(s) => s,
@@ -574,6 +596,7 @@ async fn main() -> Result<()> {
                 signal.size_usdc, entry_price, remaining, num_ws, vol_tracker.current_vol(),
                 &macro_ctx, book.spread, book.bid_depth_usdc, book.ask_depth_usdc,
                 book.imbalance, book.num_bid_levels, book.num_ask_levels,
+                window_ticks.micro_vol(), window_ticks.momentum_ratio(),
             );
         }
 
@@ -761,7 +784,8 @@ async fn execute_order(
     })
 }
 
-/// Resolve a pending bet: compute PnL, log to CSV, check circuit breaker.
+/// Resolve a pending bet: compute PnL, log to CSV, calibrate, check circuit breaker.
+#[allow(clippy::too_many_arguments)]
 fn resolve_pending_bet(
     bet: PendingBet,
     current_btc: f64,
@@ -769,7 +793,8 @@ fn resolve_pending_bet(
     current_window: u64,
     session: &mut strategy::Session,
     csv: &mut Option<logger::CsvLogger>,
-    strat_config: &strategy::StrategyConfig,
+    strat_config: &mut strategy::StrategyConfig,
+    calibrator: &mut strategy::Calibrator,
 ) {
     let went_up = resolve_up(bet.start_price, current_btc);
     let won = (went_up && bet.side == polymarket::Side::Buy)
@@ -785,6 +810,32 @@ fn resolve_pending_bet(
         csv.log_resolution(now, current_window, bet.start_price, current_btc,
             result_str, pnl, session.pnl_usdc, session.trades, session.win_rate() * 100.0);
     }
+
+    // Auto-calibration: record prediction and check if recalibration is due
+    let predicted_p = if bet.side == polymarket::Side::Buy {
+        1.0 - bet.entry_price
+    } else {
+        bet.entry_price
+    };
+    calibrator.record(predicted_p, won);
+
+    if calibrator.should_recalibrate() {
+        if let Some((new_mult, brier)) = calibrator.recalibrate() {
+            tracing::info!("Auto-calibration: vcm {:.2} → {:.2} (brier={:.4})",
+                strat_config.vol_confidence_multiplier, new_mult, brier);
+            strat_config.vol_confidence_multiplier = new_mult;
+            let cal_json = serde_json::json!({
+                "vol_confidence_multiplier": new_mult,
+                "brier_score": brier,
+                "trades_used": 200,
+                "timestamp": now,
+            });
+            if let Err(e) = std::fs::write("calibration.json", cal_json.to_string()) {
+                tracing::warn!("Failed to save calibration.json: {e}");
+            }
+        }
+    }
+
     session.check_circuit_breaker(
         strat_config.circuit_breaker_window,
         strat_config.circuit_breaker_min_wr,

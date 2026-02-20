@@ -177,12 +177,10 @@ impl VolTracker {
 /// Buffer de prix intra-window pour le regime detection.
 /// Collecte les ticks pendant une fenêtre 5min et calcule micro-vol + momentum.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct WindowTicks {
     prices: Vec<f64>,
 }
 
-#[allow(dead_code)]
 impl WindowTicks {
     pub fn new() -> Self {
         Self { prices: Vec::with_capacity(3200) }
@@ -231,13 +229,11 @@ impl WindowTicks {
 /// Auto-calibration: tracks (predicted_prob, actual_outcome) pairs and
 /// recalibrates vol_confidence_multiplier by minimizing Brier Score.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct Calibrator {
     entries: Vec<(f64, bool)>,
     recalibrate_every: usize,
 }
 
-#[allow(dead_code)]
 impl Calibrator {
     pub fn new(recalibrate_every: usize) -> Self {
         Self {
@@ -250,6 +246,7 @@ impl Calibrator {
         self.entries.push((predicted_prob, won));
     }
 
+    #[allow(dead_code)]
     pub fn count(&self) -> usize {
         self.entries.len()
     }
@@ -259,6 +256,7 @@ impl Calibrator {
     }
 
     /// Brier Score on current entries.
+    #[allow(dead_code)]
     pub fn brier_score(&self) -> f64 {
         if self.entries.is_empty() {
             return 1.0;
@@ -319,6 +317,8 @@ pub struct TradeContext {
     pub spread: f64,
     pub book_imbalance: f64,
     pub num_ws_sources: u32,
+    pub micro_vol: f64,
+    pub momentum_ratio: f64,
 }
 
 /// Évalue si on doit trader sur cet intervalle.
@@ -477,6 +477,15 @@ pub fn evaluate(
     // 8b. Loss decay: reduce sizing exponentially during losing streaks
     let loss_decay = 0.7_f64.powi(session.consecutive_losses as i32);
     let kelly_size = kelly_size * loss_decay;
+    // 8c. Regime factor: reduce sizing in choppy/high-microvol markets
+    let mut regime_factor = 1.0;
+    if ctx.momentum_ratio < 0.55 {
+        regime_factor *= 0.5;
+    }
+    if ctx.vol_5min_pct > 0.0 && ctx.micro_vol > ctx.vol_5min_pct * 2.0 {
+        regime_factor *= 0.6;
+    }
+    let kelly_size = kelly_size * regime_factor;
     // 8a. Book imbalance boost: higher imbalance → larger bet
     let imbalance_boost = 1.0 + (ctx.book_imbalance - config.min_book_imbalance).clamp(0.0, 1.0);
     let kelly_size = (kelly_size * imbalance_boost).min(config.max_bet_usdc);
@@ -627,6 +636,8 @@ mod tests {
             spread: 0.0,
             book_imbalance: 0.5,
             num_ws_sources: 3,
+            micro_vol: 0.0,
+            momentum_ratio: 1.0,
         }
     }
 
@@ -1227,6 +1238,8 @@ mod tests {
             spread: 0.02,
             book_imbalance: 0.65,
             num_ws_sources: 3,
+            micro_vol: 0.0,
+            momentum_ratio: 1.0,
         };
         let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_some(), "should trade with +0.05% at 8s");
@@ -1254,6 +1267,8 @@ mod tests {
             spread: 0.02,
             book_imbalance: 0.20,
             num_ws_sources: 3,
+            micro_vol: 0.0,
+            momentum_ratio: 1.0,
         };
         let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_none(), "weak +0.005% should not pass 3% min edge");
@@ -1276,6 +1291,8 @@ mod tests {
             spread: 0.01,
             book_imbalance: 0.20,
             num_ws_sources: 3,
+            micro_vol: 0.0,
+            momentum_ratio: 1.0,
         };
         let signal = evaluate(&ctx, &session, &config);
         if let Some(s) = signal {
@@ -1302,6 +1319,8 @@ mod tests {
             spread: 0.02,
             book_imbalance: 0.20,
             num_ws_sources: 3,
+            micro_vol: 0.0,
+            momentum_ratio: 1.0,
         };
         let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_none(), "should stop after -$10 (25% of $40 portfolio)");
@@ -1325,6 +1344,8 @@ mod tests {
             spread: 0.80, // 40% spread cost → kills edge below 3%
             book_imbalance: 0.20,
             num_ws_sources: 3,
+            micro_vol: 0.0,
+            momentum_ratio: 1.0,
         };
         let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_none(), "wide spread should kill the edge below 3% min");
@@ -1888,5 +1909,61 @@ mod tests {
         let _ = cal.recalibrate();
         assert_eq!(cal.count(), 0);
         assert!(!cal.should_recalibrate());
+    }
+
+    #[test]
+    fn regime_choppy_reduces_sizing() {
+        let config = StrategyConfig { min_edge_pct: 1.0, ..test_config() };
+        let session = Session::new(40.0);
+        let ctx_good = TradeContext {
+            chainlink_price: 100_050.0,
+            micro_vol: 0.001,
+            momentum_ratio: 0.9,
+            ..test_ctx()
+        };
+        let sig_good = evaluate(&ctx_good, &session, &config);
+
+        let ctx_choppy = TradeContext {
+            chainlink_price: 100_050.0,
+            micro_vol: 0.001,
+            momentum_ratio: 0.45,
+            ..test_ctx()
+        };
+        let sig_choppy = evaluate(&ctx_choppy, &session, &config);
+
+        assert!(sig_good.is_some());
+        if let Some(sc) = sig_choppy {
+            assert!(sc.size_usdc <= sig_good.unwrap().size_usdc,
+                "choppy regime should reduce sizing");
+        }
+    }
+
+    #[test]
+    fn regime_high_microvol_reduces_sizing() {
+        let config = StrategyConfig { min_edge_pct: 1.0, ..test_config() };
+        let session = Session::new(40.0);
+        let ctx_normal = TradeContext {
+            chainlink_price: 100_050.0,
+            vol_5min_pct: 0.10,
+            micro_vol: 0.05,
+            momentum_ratio: 0.9,
+            ..test_ctx()
+        };
+        let sig_normal = evaluate(&ctx_normal, &session, &config);
+
+        let ctx_high = TradeContext {
+            chainlink_price: 100_050.0,
+            vol_5min_pct: 0.10,
+            micro_vol: 0.25,
+            momentum_ratio: 0.9,
+            ..test_ctx()
+        };
+        let sig_high = evaluate(&ctx_high, &session, &config);
+
+        assert!(sig_normal.is_some());
+        if let Some(sh) = sig_high {
+            assert!(sh.size_usdc <= sig_normal.unwrap().size_usdc,
+                "high micro_vol should reduce sizing");
+        }
     }
 }

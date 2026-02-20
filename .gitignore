@@ -3,3 +3,4 @@ config.toml
 *.pem
 *.key
 __pycache__/
+calibration.json
