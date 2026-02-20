@@ -340,6 +340,9 @@ pub fn evaluate(
     if kelly_size <= 0.0 {
         return None;
     }
+    // 8b. Loss decay: reduce sizing exponentially during losing streaks
+    let loss_decay = 0.7_f64.powi(session.consecutive_losses as i32);
+    let kelly_size = kelly_size * loss_decay;
     // 8a. Book imbalance boost: higher imbalance → larger bet
     let imbalance_boost = 1.0 + (ctx.book_imbalance - config.min_book_imbalance).clamp(0.0, 1.0);
     let kelly_size = (kelly_size * imbalance_boost).min(config.max_bet_usdc);
@@ -1530,5 +1533,35 @@ mod tests {
         // MAD should resist: vol should not jump more than 2x
         assert!(vol_after < vol_before * 2.0,
             "MAD should resist outlier: before={vol_before:.4}, after={vol_after:.4}");
+    }
+
+    #[test]
+    fn loss_decay_reduces_sizing() {
+        let config = StrategyConfig { min_edge_pct: 1.0, kelly_fraction: 0.25, ..test_config() };
+        let ctx = TradeContext {
+            start_price: 100_000.0,
+            chainlink_price: 100_100.0,
+            exchange_price: Some(100_100.0),
+            market_up_price: 0.55,
+            seconds_remaining: 5,
+            vol_5min_pct: 0.12,
+            book_imbalance: 0.5,
+            ..test_ctx()
+        };
+
+        // 0 losses → full size
+        let session_0 = Session::new(40.0);
+        let sig_0 = evaluate(&ctx, &session_0, &config).unwrap();
+
+        // 3 consecutive losses → decayed size (0.7^3 = 0.343)
+        let mut session_3 = Session::new(40.0);
+        for _ in 0..3 { session_3.record_trade(-1.0); }
+        let sig_3 = evaluate(&ctx, &session_3, &config);
+
+        if let Some(s3) = sig_3 {
+            assert!(s3.size_usdc < sig_0.size_usdc,
+                "3 losses should reduce size: {} vs {}", s3.size_usdc, sig_0.size_usdc);
+        }
+        // Either smaller or skipped entirely — both are valid
     }
 }
