@@ -413,6 +413,8 @@ async fn main() -> Result<()> {
             }
         };
 
+        let price_source = if rtds_price.is_some() { "RTDS" } else if ws_price.is_some() { "WS" } else { "CL" };
+
         window_ticks.tick(current_btc, now * 1000);
 
         // Nouvel intervalle 5min — résoudre le bet précédent
@@ -420,7 +422,7 @@ async fn main() -> Result<()> {
             // Log skip si le window précédent n'a pas donné de trade
             if current_window > 0 && !traded_this_window {
                 if let Some(ref mut csv) = csv {
-                    csv.log_skip(now, current_window, start_price, current_btc, last_mid, num_ws, vol_tracker.current_vol(), &macro_ctx, &skip_reason);
+                    csv.log_skip(now, current_window, start_price, current_btc, last_mid, num_ws, price_source, vol_tracker.current_vol(), &macro_ctx, &skip_reason);
                 }
             }
 
@@ -593,10 +595,17 @@ async fn main() -> Result<()> {
                 now, current_window, start_price, current_btc,
                 market_up_price, signal.implied_p_up, side_label, token_label,
                 signal.edge_brut_pct, signal.edge_pct, signal.fee_pct,
-                signal.size_usdc, entry_price, remaining, num_ws, vol_tracker.current_vol(),
+                signal.size_usdc, entry_price,
+                0, if dry_run { "dry_run" } else if order_type == "GTC" { "GTC_filled" } else { "FOK_filled" },
+                remaining, num_ws, price_source, vol_tracker.current_vol(),
                 &macro_ctx, book.spread, book.bid_depth_usdc, book.ask_depth_usdc,
-                book.imbalance, book.num_bid_levels, book.num_ask_levels,
+                book.imbalance, book.best_bid, book.best_ask,
+                book.num_bid_levels, book.num_ask_levels,
                 window_ticks.micro_vol(), window_ticks.momentum_ratio(),
+                window_ticks.sign_changes(), window_ticks.max_drawdown_bps(),
+                window_ticks.time_at_extreme_s(start_price), window_ticks.ticks_count(),
+                session.pnl_usdc, session.trades, session.win_rate() * 100.0,
+                session.consecutive_wins, session.session_drawdown_pct(),
             );
         }
 
@@ -620,7 +629,7 @@ async fn main() -> Result<()> {
                 tracing::warn!("Ordre {reason} — loggé comme skip");
                 if let Some(ref mut csv) = csv {
                     csv.log_skip(now, current_window, start_price, current_btc,
-                        market_up_price, num_ws, vol_tracker.current_vol(), &macro_ctx, reason);
+                        market_up_price, num_ws, price_source, vol_tracker.current_vol(), &macro_ctx, reason);
                 }
             }
             traded_this_window = true;
@@ -808,7 +817,8 @@ fn resolve_pending_bet(
     );
     if let Some(ref mut csv) = csv {
         csv.log_resolution(now, current_window, bet.start_price, current_btc,
-            result_str, pnl, session.pnl_usdc, session.trades, session.win_rate() * 100.0);
+            result_str, pnl, session.pnl_usdc, session.trades, session.win_rate() * 100.0,
+            session.consecutive_wins, session.session_drawdown_pct());
     }
 
     // Auto-calibration: record prediction and check if recalibration is due
