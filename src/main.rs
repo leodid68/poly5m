@@ -359,28 +359,8 @@ async fn main() -> Result<()> {
             }
 
             if let Some(bet) = pending_bet.take() {
-                // Polymarket rule: end_price >= start_price → UP wins (equality = UP)
-                let went_up = resolve_up(bet.start_price, current_btc);
-                let won = (went_up && bet.side == polymarket::Side::Buy)
-                    || (!went_up && bet.side != polymarket::Side::Buy);
-                let pnl = compute_pnl(won, bet.size_usdc, bet.entry_price, bet.fee_pct);
-                session.record_trade(pnl);
-                let result_str = if won { "WIN" } else { "LOSS" };
-                tracing::info!(
-                    "Résolution: {} | PnL: ${:.2} | Session: ${:.2} | WR: {:.0}%",
-                    result_str, pnl, session.pnl_usdc, session.win_rate() * 100.0,
-                );
-                if let Some(ref mut csv) = csv {
-                    csv.log_resolution(now, current_window, bet.start_price, current_btc,
-                        result_str, pnl, session.pnl_usdc, session.trades, session.win_rate() * 100.0);
-                }
-                // Check circuit breaker after each resolution
-                session.check_circuit_breaker(
-                    strat_config.circuit_breaker_window,
-                    strat_config.circuit_breaker_min_wr,
-                    strat_config.circuit_breaker_cooldown_s,
-                    now,
-                );
+                resolve_pending_bet(bet, current_btc, now, current_window,
+                    &mut session, &mut csv, &strat_config);
             }
 
             // Enregistrer le mouvement de l'intervalle précédent pour la vol dynamique
@@ -428,28 +408,13 @@ async fn main() -> Result<()> {
 
         // Fenêtre d'entrée : fetch marché (cache) + midpoint + fee rate
         let (market, market_up_price, fee_rate_bps) = if let Some(ref poly) = poly {
-            if cached_market.is_none() {
-                match poly.find_5min_btc_market(current_window).await {
-                    Ok(m) => cached_market = Some(m),
-                    Err(e) => {
-                        tracing::warn!("Marché introuvable: {e:#}");
-                        skip_reason = format!("market_err:{e}");
-                        continue;
-                    }
-                }
-            }
-            let market = cached_market.as_ref().unwrap();
-            let mid = match poly.get_midpoint(&market.token_id_yes).await {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!("Midpoint error: {e:#}");
-                    skip_reason = format!("midpoint_err:{e}");
+            match fetch_market_data(poly, &mut cached_market, current_window, default_fee_rate_bps).await {
+                Ok(data) => (Some(data.market), data.mid_price, data.fee_rate_bps),
+                Err(reason) => {
+                    skip_reason = reason;
                     continue;
                 }
-            };
-            let fee = poly.get_fee_rate(&market.token_id_yes).await
-                .unwrap_or(default_fee_rate_bps);
-            (Some(market.clone()), mid, fee)
+            }
         } else {
             (None, 0.50, default_fee_rate_bps)
         };
@@ -715,6 +680,77 @@ async fn execute_order(
             entry_price,
             fee_pct: if pays_taker_fee { signal.fee_pct } else { 0.0 },
         }
+    })
+}
+
+/// Resolve a pending bet: compute PnL, log to CSV, check circuit breaker.
+fn resolve_pending_bet(
+    bet: PendingBet,
+    current_btc: f64,
+    now: u64,
+    current_window: u64,
+    session: &mut strategy::Session,
+    csv: &mut Option<logger::CsvLogger>,
+    strat_config: &strategy::StrategyConfig,
+) {
+    let went_up = resolve_up(bet.start_price, current_btc);
+    let won = (went_up && bet.side == polymarket::Side::Buy)
+        || (!went_up && bet.side != polymarket::Side::Buy);
+    let pnl = compute_pnl(won, bet.size_usdc, bet.entry_price, bet.fee_pct);
+    session.record_trade(pnl);
+    let result_str = if won { "WIN" } else { "LOSS" };
+    tracing::info!(
+        "Résolution: {} | PnL: ${:.2} | Session: ${:.2} | WR: {:.0}%",
+        result_str, pnl, session.pnl_usdc, session.win_rate() * 100.0,
+    );
+    if let Some(ref mut csv) = csv {
+        csv.log_resolution(now, current_window, bet.start_price, current_btc,
+            result_str, pnl, session.pnl_usdc, session.trades, session.win_rate() * 100.0);
+    }
+    session.check_circuit_breaker(
+        strat_config.circuit_breaker_window,
+        strat_config.circuit_breaker_min_wr,
+        strat_config.circuit_breaker_cooldown_s,
+        now,
+    );
+}
+
+struct MarketData {
+    market: polymarket::Market,
+    mid_price: f64,
+    fee_rate_bps: u32,
+}
+
+/// Fetch market, midpoint, and fee rate from Polymarket (with cache).
+async fn fetch_market_data(
+    poly: &polymarket::PolymarketClient,
+    cached_market: &mut Option<polymarket::Market>,
+    current_window: u64,
+    default_fee_rate_bps: u32,
+) -> Result<MarketData, String> {
+    if cached_market.is_none() {
+        match poly.find_5min_btc_market(current_window).await {
+            Ok(m) => *cached_market = Some(m),
+            Err(e) => {
+                tracing::warn!("Marché introuvable: {e:#}");
+                return Err(format!("market_err:{e}"));
+            }
+        }
+    }
+    let market = cached_market.as_ref().unwrap();
+    let mid = match poly.get_midpoint(&market.token_id_yes).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("Midpoint error: {e:#}");
+            return Err(format!("midpoint_err:{e}"));
+        }
+    };
+    let fee = poly.get_fee_rate(&market.token_id_yes).await
+        .unwrap_or(default_fee_rate_bps);
+    Ok(MarketData {
+        market: market.clone(),
+        mid_price: mid,
+        fee_rate_bps: fee,
     })
 }
 
