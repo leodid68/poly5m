@@ -143,6 +143,8 @@ struct StrategyToml {
     min_implied_prob: f64,
     #[serde(default)]
     max_consecutive_losses: u32,
+    #[serde(default = "default_student_t_df")]
+    student_t_df: f64,
 }
 
 fn default_min_bet_usdc() -> f64 { 1.0 }
@@ -161,6 +163,7 @@ fn default_initial_bankroll() -> f64 { 40.0 }
 fn default_vol_confidence_multiplier() -> f64 { 4.0 }
 fn default_circuit_breaker_window() -> usize { 0 }
 fn default_circuit_breaker_cooldown() -> u64 { 1800 }
+fn default_student_t_df() -> f64 { 4.0 }
 
 impl From<StrategyToml> for strategy::StrategyConfig {
     fn from(s: StrategyToml) -> Self {
@@ -190,6 +193,7 @@ impl From<StrategyToml> for strategy::StrategyConfig {
             circuit_breaker_cooldown_s: s.circuit_breaker_cooldown_s,
             min_implied_prob: s.min_implied_prob,
             max_consecutive_losses: s.max_consecutive_losses,
+            student_t_df: s.student_t_df,
         }
     }
 }

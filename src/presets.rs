@@ -29,6 +29,7 @@ pub fn sniper() -> StrategyConfig {
         circuit_breaker_cooldown_s: 900,
         min_implied_prob: 0.75,
         max_consecutive_losses: 6,
+        student_t_df: 4.0,
     }
 }
 
@@ -61,6 +62,7 @@ pub fn conviction() -> StrategyConfig {
         circuit_breaker_cooldown_s: 1200,
         min_implied_prob: 0.80,
         max_consecutive_losses: 5,
+        student_t_df: 4.0,
     }
 }
 
@@ -93,6 +95,7 @@ pub fn scalper() -> StrategyConfig {
         circuit_breaker_cooldown_s: 600,
         min_implied_prob: 0.85,
         max_consecutive_losses: 6,
+        student_t_df: 4.0,
     }
 }
 
@@ -125,6 +128,7 @@ pub fn farm() -> StrategyConfig {
         circuit_breaker_cooldown_s: 0,
         min_implied_prob: 0.0,
         max_consecutive_losses: 0,
+        student_t_df: 0.0,
     }
 }
 

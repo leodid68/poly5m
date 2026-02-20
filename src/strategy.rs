@@ -34,6 +34,10 @@ pub struct StrategyConfig {
     /// Maximum consecutive losses before pausing (0 = disabled).
     /// Data shows loss streaks of 13 — this caps exposure during drawdowns.
     pub max_consecutive_losses: u32,
+    /// Degrees of freedom for Student-t CDF (0.0 = use normal CDF).
+    /// Lower df = heavier tails = more conservative. Recommended: 4.0.
+    #[allow(dead_code)] // Used in Task 2 (Student-t CDF logic)
+    pub student_t_df: f64,
 }
 
 /// Signal de trade émis par la stratégie.
@@ -470,6 +474,7 @@ mod tests {
             circuit_breaker_cooldown_s: 1800,
             min_implied_prob: 0.0,
             max_consecutive_losses: 0,
+            student_t_df: 0.0,
         }
     }
 
@@ -1067,6 +1072,7 @@ mod tests {
             circuit_breaker_cooldown_s: 900,
             min_implied_prob: 0.75,    // Data: low-confidence trades lose
             max_consecutive_losses: 6, // Data: cap exposure during drawdowns
+            student_t_df: 4.0,
         }
     }
 
