@@ -189,6 +189,93 @@ impl OutcomeLogger {
     }
 }
 
+/// Logs every price tick for granular analysis.
+/// Rotates to a new file each day (ticks_YYYYMMDD.csv).
+pub struct TickLogger {
+    writer: BufWriter<File>,
+    base_dir: String,
+    current_date: String,
+}
+
+impl TickLogger {
+    pub fn new(base_dir: &str) -> Result<Self> {
+        std::fs::create_dir_all(base_dir).context("Cannot create ticks directory")?;
+        let date = Self::today_str();
+        let path = format!("{base_dir}/ticks_{date}.csv");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .context("Cannot create tick log file")?;
+        let needs_header = file.metadata().map(|m| m.len() == 0).unwrap_or(true);
+        let mut writer = BufWriter::new(file);
+        if needs_header {
+            writeln!(writer, "timestamp_ms,source,price,window")?;
+            writer.flush()?;
+        }
+        Ok(Self { writer, base_dir: base_dir.to_string(), current_date: date })
+    }
+
+    pub fn log_tick(&mut self, timestamp_ms: u64, source: &str, price: f64, window: u64) {
+        let _ = self.rotate_if_needed();
+        if let Err(e) = writeln!(self.writer, "{timestamp_ms},{source},{price:.2},{window}")
+            .and_then(|_| self.writer.flush())
+        {
+            tracing::warn!("Tick CSV write error: {e}");
+        }
+    }
+
+    fn rotate_if_needed(&mut self) -> Result<()> {
+        let today = Self::today_str();
+        if today != self.current_date {
+            let path = format!("{}/ticks_{today}.csv", self.base_dir);
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .context("Cannot create new tick log file")?;
+            let needs_header = file.metadata().map(|m| m.len() == 0).unwrap_or(true);
+            self.writer = BufWriter::new(file);
+            if needs_header {
+                writeln!(self.writer, "timestamp_ms,source,price,window")?;
+                self.writer.flush()?;
+            }
+            self.current_date = today;
+        }
+        Ok(())
+    }
+
+    fn today_str() -> String {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Self::date_from_epoch(secs)
+    }
+
+    fn date_from_epoch(secs: u64) -> String {
+        let days = secs / 86400;
+        let mut y = 1970u32;
+        let mut remaining = days as u32;
+        loop {
+            let days_in_year = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
+            if remaining < days_in_year { break; }
+            remaining -= days_in_year;
+            y += 1;
+        }
+        let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+        let months = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let mut m = 1u32;
+        for &days_in_month in &months {
+            if remaining < days_in_month { break; }
+            remaining -= days_in_month;
+            m += 1;
+        }
+        let d = remaining + 1;
+        format!("{y}{m:02}{d:02}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,5 +407,37 @@ mod tests {
         assert_eq!(lines.len(), 3, "1 header + 2 data rows, got: {lines:?}");
         assert!(lines[2].contains("false"));
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn tick_logger_writes_ticks() {
+        let dir = "/tmp/poly5m_test_ticks";
+        let _ = std::fs::remove_dir_all(dir);
+        let mut logger = super::TickLogger::new(dir).unwrap();
+        logger.log_tick(1700000000000, "RTDS", 97150.50, 1699999800);
+        logger.log_tick(1700000000100, "WS", 97150.80, 1699999800);
+        drop(logger);
+
+        let entries: Vec<_> = std::fs::read_dir(dir).unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let content = std::fs::read_to_string(entries[0].path()).unwrap();
+        let lines: Vec<&str> = content.trim().lines().collect();
+        assert_eq!(lines.len(), 3); // header + 2 ticks
+        assert!(lines[0].starts_with("timestamp_ms,"));
+        assert!(lines[1].contains("RTDS"));
+        assert!(lines[2].contains("WS"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn tick_logger_date_from_epoch() {
+        // 2026-02-20 00:00:00 UTC = 1771545600
+        assert_eq!(super::TickLogger::date_from_epoch(1771545600), "20260220");
+        // 2024-02-29 (leap year)
+        assert_eq!(super::TickLogger::date_from_epoch(1709164800), "20240229");
+        // 1970-01-01
+        assert_eq!(super::TickLogger::date_from_epoch(0), "19700101");
     }
 }

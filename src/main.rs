@@ -363,6 +363,25 @@ async fn main() -> Result<()> {
         None
     };
 
+    let mut tick_csv = if !config.logging.csv_path.is_empty() {
+        let tick_dir = std::path::Path::new(&config.logging.csv_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("ticks");
+        match logger::TickLogger::new(tick_dir.to_str().unwrap_or("ticks")) {
+            Ok(l) => {
+                tracing::info!("Tick logging → {}", tick_dir.display());
+                Some(l)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to create tick logger: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let macro_http = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()?;
@@ -432,6 +451,10 @@ async fn main() -> Result<()> {
         let price_source = if rtds_price.is_some() { "RTDS" } else if ws_price.is_some() { "WS" } else { "CL" };
 
         window_ticks.tick(current_btc, now * 1000);
+
+        if let Some(ref mut tl) = tick_csv {
+            tl.log_tick(now * 1000, price_source, current_btc, current_window);
+        }
 
         // Nouvel intervalle 5min — résoudre le bet précédent
         if window != current_window {
