@@ -1,15 +1,17 @@
 # poly5m — Bot d'arbitrage Polymarket 5min BTC
 
-Bot Rust qui trade les marches [Polymarket BTC 5-minute UP/DOWN](https://polymarket.com) en exploitant le delai entre les mises a jour Chainlink et le repricing du marche.
+Bot Rust qui trade les marches [Polymarket BTC 5-minute UP/DOWN](https://polymarket.com) en exploitant le delai entre les mises a jour de prix et le repricing du marche.
 
 ## Fonctionnement
 
-1. **Poll Chainlink** toutes les 100ms via 3 RPCs en racing (Alchemy + publics) — prend la reponse la plus rapide
-2. **Detecte le window 5min** en cours et enregistre le prix de debut
-3. **Dans les 10 dernieres secondes**, recupere le marche Polymarket actif et son midpoint
-4. **Calcule la probabilite** que BTC finisse UP ou DOWN avec un modele z-score (volatilite residuelle)
-5. **Si edge > 2%**, place un ordre FOK (Fill-Or-Kill) avec sizing Half-Kelly
-6. **Resout le PnL** au debut du window suivant en comparant le prix Chainlink
+1. **Prix multi-source** : WebSockets Binance/Coinbase/Kraken + Polymarket RTDS + Chainlink on-chain (fallback)
+2. **Detecte le window 5min** en cours, enregistre le prix de debut, collecte les ticks intra-window
+3. **Regime detection** : filtre les marches choppants via micro-volatilite et momentum ratio
+4. **Modele hybride** : z-score (vol dynamique) + book imbalance (30%), CDF Student-t (df=4)
+5. **Si edge net > seuil** apres frais dynamiques : ordre FOK/GTC avec sizing Half-Kelly
+6. **Risk management** : circuit breaker, max consecutive losses, profit target / loss limit
+7. **Auto-calibration** : ajuste le multiplicateur de confiance vol tous les N trades
+8. **Logging complet** : 51 colonnes CSV + outcome logger (toutes les fenetres) + tick logger (rotation quotidienne)
 
 ## Architecture
 
@@ -17,8 +19,13 @@ Bot Rust qui trade les marches [Polymarket BTC 5-minute UP/DOWN](https://polymar
 src/
   main.rs        — Boucle principale, config, racing RPC, flow de trading
   chainlink.rs   — Lecture prix BTC/USD via latestRoundData()
-  polymarket.rs  — Client CLOB API (discovery, midpoint, ordres FOK, EIP-712, HMAC)
-  strategy.rs    — Modele de probabilite, Half-Kelly, session limits (15 tests)
+  polymarket.rs  — Client CLOB API (discovery, midpoint, orderbook, ordres, EIP-712, HMAC)
+  strategy.rs    — Modele hybride, Session, VolTracker, WindowTicks, Calibrator (144 tests)
+  exchanges.rs   — WebSocket multi-exchange : Binance, Coinbase, Kraken
+  rtds.rs        — Polymarket Real-Time Data Streams WebSocket
+  macro_data.rs  — Donnees macro CoinGecko (1h/24h change, volume, funding rate)
+  logger.rs      — CsvLogger (51 cols), OutcomeLogger, TickLogger
+  presets.rs     — Presets de configuration par marche
 ```
 
 ## Deploiement VPS
@@ -64,6 +71,7 @@ rpc_urls = [
 ]
 btc_usd_feed = "0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c"
 poll_interval_ms = 100
+poll_interval_ms_with_ws = 1000
 
 [polymarket]
 api_key = "xxx"
@@ -72,12 +80,36 @@ passphrase = "xxx"
 private_key = "0xXXX"
 
 [strategy]
-max_bet_usdc = 5.0
+max_bet_usdc = 2.0
+min_bet_usdc = 0.10
 min_edge_pct = 2.0
 entry_seconds_before_end = 10
 session_profit_target_usdc = 20.0
 session_loss_limit_usdc = 10.0
+kelly_fraction = 0.10
+vol_confidence_multiplier = 4.0
+min_market_price = 0.20
+max_market_price = 0.80
+min_payout_ratio = 1.10
+min_book_imbalance = 0.05
+max_vol_5min_pct = 0.50
+min_ws_sources = 2
+circuit_breaker_window = 20
+circuit_breaker_min_wr = 0.40
+circuit_breaker_cooldown_s = 600
+min_implied_prob = 0.70
+max_consecutive_losses = 10
+student_t_df = 4.0
 dry_run = false
+
+[exchanges]
+enabled = true
+
+[rtds]
+enabled = true
+
+[logging]
+csv_path = "trades.csv"
 ```
 
 Securiser le fichier :
@@ -131,17 +163,35 @@ sudo journalctl -u poly5m -f   # voir les logs
 
 | Parametre | Description | Defaut |
 |-----------|-------------|--------|
-| `max_bet_usdc` | Mise max par trade (min Polymarket = $5) | 5.0 |
-| `min_edge_pct` | Edge minimum pour trader | 2.0% |
+| `max_bet_usdc` | Mise max par trade | 2.0 |
+| `min_bet_usdc` | Mise min par trade | 0.10 |
+| `min_edge_pct` | Edge net minimum pour trader | 2.0% |
+| `kelly_fraction` | Fraction de Kelly (conservateur) | 0.10 |
+| `vol_confidence_multiplier` | Multiplicateur sur la vol residuelle | 4.0 |
 | `entry_seconds_before_end` | Fenetre d'entree avant fin du window | 10s |
 | `session_profit_target_usdc` | Arret si profit atteint | $20 |
 | `session_loss_limit_usdc` | Arret si perte atteinte | $10 |
+| `min_market_price` / `max_market_price` | Filtre zone de prix (evite 50/50) | 0.20 / 0.80 |
+| `min_implied_prob` | Prob minimale pour trader | 0.70 |
+| `max_consecutive_losses` | Arret apres N pertes consecutives | 10 |
+| `circuit_breaker_window` | Rolling WR sur N trades | 20 |
+| `circuit_breaker_min_wr` | WR minimum avant pause | 40% |
+| `student_t_df` | Degres de liberte Student-t (0 = normal) | 4.0 |
 | `dry_run` | Mode simulation (pas d'ordres reels) | false |
+
+## Fichiers generes
+
+| Fichier | Description |
+|---------|-------------|
+| `trades.csv` | 51 colonnes : tous les trades, skips et resolutions |
+| `outcomes.csv` | Toutes les fenetres 5min (meme sans trade) pour backtesting |
+| `ticks/ticks_YYYYMMDD.csv` | Tick-level data avec rotation quotidienne (~2-3 MB/jour) |
+| `calibration.json` | VCM auto-calibre, persiste entre sessions |
 
 ## Notes
 
 - Le bot ne trade qu'**une fois par window de 5 minutes**
-- Les ordres sont **FOK** (Fill-Or-Kill) : executes immediatement ou annules
+- Les ordres sont **FOK** ou **GTC** avec maker pricing (bid + 25% spread)
 - Le PnL est resolu au changement de window (approximatif, le vrai PnL est on-chain)
 - `config.toml` est dans `.gitignore` — jamais commit sur GitHub
 - Le bot doit tourner depuis un pays **non geobloque** par Polymarket (ex: Pays-Bas)
