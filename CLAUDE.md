@@ -9,23 +9,36 @@ Polymarket utilise Chainlink Data Streams (pull-based, sub-seconde) pour résoud
 ## Architecture actuelle
 
 ```
-┌──────────────┐     ┌──────────────────┐     ┌──────────────────┐
-│  Chainlink   │────▶│   Strategy       │────▶│   Polymarket     │
-│  (prix BTC)  │     │   (décision)     │     │   (ordres)       │
-│              │     │                  │     │                  │
-│ latestRound  │     │ time-aware prob  │     │ CLOB API         │
-│ Data() via   │     │ half-Kelly size  │     │ EIP-712 signing  │
-│ alloy RPC    │     │ session limits   │     │ HMAC-SHA256 L2   │
-│ racing multi │     │                  │     │ FOK orders       │
-└──────────────┘     └──────────────────┘     └──────────────────┘
+┌──────────────┐
+│  Exchanges   │──┐  WebSocket Binance+Coinbase+Kraken
+│  (prix BTC)  │  │  médiane multi-source
+└──────────────┘  │
+┌──────────────┐  │  ┌──────────────────┐     ┌──────────────────┐
+│  Chainlink   │──┼─▶│   Strategy       │────▶│   Polymarket     │
+│  (on-chain)  │  │  │   (décision)     │     │   (ordres)       │
+└──────────────┘  │  │                  │     │                  │
+┌──────────────┐  │  │ hybrid z+book    │     │ CLOB API         │
+│  RTDS        │──┘  │ Student-t CDF    │     │ EIP-712 signing  │
+│  (Polymarket │     │ half-Kelly size  │     │ FOK/GTC orders   │
+│   live data) │     │ session limits   │     │ maker pricing    │
+└──────────────┘     │ circuit breaker  │     └──────────────────┘
+                     │ vol dynamique    │
+┌──────────────┐     │ regime detect    │     ┌──────────────────┐
+│  Macro Data  │────▶│ auto-calibration │     │   Logger         │
+│  (CoinGecko) │     └──────────────────┘     │   (51-col CSV)   │
+└──────────────┘                              │   OutcomeLogger  │
+                                              │   TickLogger     │
+                                              └──────────────────┘
 ```
 
 ## Stack technique
 
 - **Rust 2021 edition** avec `alloy` (pas ethers)
 - **alloy** : provider HTTP, sol! macro, EIP-712 signing, PrivateKeySigner
-- **reqwest** : HTTP client (Polymarket API)
+- **reqwest** : HTTP client (Polymarket API, CoinGecko)
 - **tokio** : async runtime multi-thread
+- **tokio-tungstenite** : WebSocket client (Binance, Coinbase, Kraken, RTDS)
+- **statrs** : Student-t CDF pour le modèle de probabilité
 - **HMAC-SHA256 + base64** : auth Level 2 Polymarket
 - **Profil release** : LTO fat, codegen-units=1, panic=abort, strip
 
@@ -33,48 +46,86 @@ Polymarket utilise Chainlink Data Streams (pull-based, sub-seconde) pour résoud
 
 ```
 poly5m/
-├── Cargo.toml           # Dépendances (alloy, tokio, reqwest, hmac, etc.)
+├── Cargo.toml           # Dépendances (alloy, tokio, reqwest, hmac, statrs, etc.)
 ├── config.toml          # Configuration runtime (NE PAS COMMIT — dans .gitignore)
 ├── CLAUDE.md            # Ce fichier (contexte pour Claude)
 ├── GUIDE.md             # Analyse détaillée de la chaîne de données et des edges
-├── TICKETS.md           # Plan d'amélioration + specs détaillées par ticket
+├── TICKETS.md           # Plan d'amélioration + specs détaillées par ticket (tous complétés)
+├── docs/plans/          # Design docs et plans d'implémentation
 └── src/
-    ├── main.rs          # Entry point, boucle 5min, RPC racing, résolution
-    ├── chainlink.rs     # fetch_price() via alloy eth_call + ABI decode
-    ├── polymarket.rs    # Client CLOB: find market, midpoint, place_order (EIP-712)
-    └── strategy.rs      # evaluate(), prob model (CDF normale), half-Kelly, Session
+    ├── main.rs          # Entry point, boucle 5min, RPC racing, résolution (~1038 lignes)
+    ├── chainlink.rs     # fetch_price() via alloy eth_call + ABI decode (~53 lignes)
+    ├── polymarket.rs    # Client CLOB: find market, midpoint, place_order, orderbook (~504 lignes)
+    ├── strategy.rs      # evaluate(), modèle hybride, Session, VolTracker, WindowTicks, Calibrator (~2101 lignes)
+    ├── exchanges.rs     # WebSocket multi-exchange: Binance, Coinbase, Kraken (~345 lignes)
+    ├── rtds.rs          # Polymarket Real-Time Data Streams WebSocket (~202 lignes)
+    ├── macro_data.rs    # Données macro CoinGecko (btc_1h_pct, btc_24h_pct, etc.) (~114 lignes)
+    ├── logger.rs        # CsvLogger (51 cols), OutcomeLogger, TickLogger (~443 lignes)
+    └── presets.rs       # Presets de configuration par marché (~224 lignes)
 ```
 
 ## Concepts clés du code
 
-### RPC Racing (main.rs)
+### Sources de prix (main.rs, exchanges.rs, rtds.rs, chainlink.rs)
+
+Le bot fusionne 3 sources de prix :
+- **Exchanges WS** (Binance, Coinbase, Kraken) : médiane des tickers temps réel via WebSocket
+- **RTDS** (Polymarket Real-Time Data Streams) : prix live du marché Polymarket
+- **Chainlink on-chain** : `latestRoundData()` via RPC racing (fallback, heartbeat ~1h)
+
 `fetch_racing()` lance des appels simultanés vers tous les RPC providers et prend la première réponse. Utilise `futures::select_ok`.
 
-### Modèle de probabilité time-aware (strategy.rs)
+### Modèle de probabilité hybride (strategy.rs)
+
 ```
-vol_résiduelle = 0.12% × √(seconds_remaining / 300)
+vol_résiduelle = vol_dynamique × √(seconds_remaining / 300) × vol_confidence_multiplier
 z = price_change_pct / vol_résiduelle
-probabilité_UP = CDF_normale(z)
+
+# Blend z-score + book imbalance (30% book weight)
+z_blended = z × 0.7 + book_signal × 0.3
+
+probabilité_UP = Student_t_CDF(z_blended, df=4.0)
 ```
-Plus on approche de la fin de l'intervalle, plus la vol résiduelle est faible, plus le z-score est grand, plus on est confiant sur la direction.
+
+- **Vol dynamique** : `VolTracker` calcule la MAD (Median Absolute Deviation) sur les derniers N intervalles
+- **Student-t CDF** : queues lourdes (df=4.0), plus conservateur que la CDF normale
+- **Book imbalance** : (bid_depth - ask_depth) / (bid_depth + ask_depth), pondéré à 30%
+- **Regime detection** : `WindowTicks` filtre les marchés choppants (micro-vol, momentum ratio)
 
 ### Sizing demi-Kelly (strategy.rs)
+
 ```
 b = (1 - price) / price
 kelly = (b × p - q) / b
-size = (kelly / 2) × max_bet
+size = (kelly / 2) × bankroll × kelly_fraction
 ```
 
+### Session et risk management (strategy.rs)
+
+- **Session** : tracking PnL, win rate, consecutive wins/losses, drawdown
+- **Circuit breaker** : pause si rolling WR < seuil sur N derniers trades
+- **Max consecutive losses** : arrêt après N pertes consécutives
+- **Profit target / loss limit** : arrêt de session sur seuils
+
+### Auto-calibration (strategy.rs)
+
+`Calibrator` recalibre `vol_confidence_multiplier` tous les N trades en comparant la vol prédite vs réalisée. Persiste dans `calibration.json`.
+
 ### Auth Polymarket (polymarket.rs)
+
 - **EIP-712** : signe un struct `Order` avec le domain `Polymarket CTF Exchange` sur chain 137 (Polygon)
 - **HMAC-SHA256** : headers `POLY_SIGNATURE`, `POLY_TIMESTAMP`, `POLY_API_KEY`, `POLY_PASSPHRASE`, `POLY_ADDRESS`
-- **Ordres FOK** (Fill-Or-Kill) : soit l'ordre est entièrement exécuté, soit il est annulé
+- **FOK** (Fill-Or-Kill) ou **GTC** (Good-Til-Cancelled) avec maker pricing (bid + 25% spread)
+
+### Logging (logger.rs)
+
+- **CsvLogger** : 51 colonnes par trade/skip/résolution dans `trades.csv`
+- **OutcomeLogger** : log TOUTES les fenêtres 5min (même sans trade) dans `outcomes.csv` pour backtesting offline
+- **TickLogger** : chaque tick de prix dans `ticks_YYYYMMDD.csv` avec rotation quotidienne
 
 ### Dry-run mode
-Si `strategy.dry_run = true` dans config.toml, le bot simule les trades sans appeler l'API Polymarket. Utile pour valider la logique.
 
-### Résolution des bets (main.rs)
-À chaque nouvel intervalle 5min, le bot compare le prix Chainlink actuel au `start_price` du bet précédent pour déterminer WIN/LOSS et calculer le PnL.
+Si `strategy.dry_run = true` dans config.toml, le bot simule les trades sans appeler l'API Polymarket.
 
 ## Config actuelle (config.toml)
 
@@ -83,57 +134,75 @@ Si `strategy.dry_run = true` dans config.toml, le bot simule les trades sans app
 rpc_urls = ["url1", "url2", "url3"]  # Multi-RPC racing
 btc_usd_feed = "0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c"
 poll_interval_ms = 100
+poll_interval_ms_with_ws = 1000  # Ralenti quand WS actifs
 
 [polymarket]
 api_key = "..."
-api_secret = "..."      # Base64 URL-safe encoded
+api_secret = "..."
 passphrase = "..."
-private_key = "0x..."   # Clé privée Polygon wallet
+private_key = "0x..."
 
 [strategy]
 max_bet_usdc = 2.0
+min_bet_usdc = 0.10
 min_edge_pct = 2.0
 entry_seconds_before_end = 10
 session_profit_target_usdc = 20.0
 session_loss_limit_usdc = 10.0
+kelly_fraction = 0.10
+vol_confidence_multiplier = 4.0
+min_market_price = 0.20
+max_market_price = 0.80
+min_payout_ratio = 1.10
+min_book_imbalance = 0.05
+max_vol_5min_pct = 0.50
+min_ws_sources = 2
+circuit_breaker_window = 20
+circuit_breaker_min_wr = 0.40
+circuit_breaker_cooldown_s = 600
+min_implied_prob = 0.70
+max_consecutive_losses = 10
+student_t_df = 4.0
 dry_run = false
+
+[exchanges]
+enabled = true
+
+[rtds]
+enabled = true
+
+[logging]
+csv_path = "trades.csv"
 ```
 
 ## Ce que le bot fait actuellement
 
-1. Poll Chainlink `latestRoundData()` toutes les 100ms via RPC racing
-2. Détecte les intervalles 5min (window = timestamp / 300 × 300)
-3. Enregistre le prix de début d'intervalle
-4. Dans les 10 dernières secondes, fetch le midpoint Polymarket et évalue le signal
-5. Si edge > min_edge_pct → place un ordre FOK (ou simule en dry-run)
-6. Résout le bet précédent au début de l'intervalle suivant
+1. Connecte les WebSockets Binance/Coinbase/Kraken + RTDS Polymarket
+2. Poll Chainlink toutes les 100ms (1s si WS actifs) via RPC racing
+3. Calcule la médiane des prix multi-source à chaque tick
+4. Détecte les intervalles 5min, enregistre `start_price`
+5. Collecte les ticks intra-window (WindowTicks) pour regime detection
+6. Fetch données macro CoinGecko toutes les 5 min
+7. Dans les N dernières secondes, fetch midpoint + orderbook Polymarket
+8. Évalue le signal hybride (z-score + book imbalance + Student-t)
+9. Filtre : frais dynamiques, zone de prix, micro-vol, momentum, circuit breaker
+10. Si edge net > seuil → place un ordre FOK/GTC avec maker pricing
+11. Log le trade (51 colonnes CSV) + tick logger + outcome logger
+12. Résout le bet précédent au début de l'intervalle suivant
+13. Auto-calibre le VCM tous les N trades
 
-## Limitations connues (à corriger — voir TICKETS.md)
+## CSV — 51 colonnes (trades.csv)
 
-1. **Pas de frais dynamiques** : le bot ne tient pas compte des taker fees Polymarket (jusqu'à 3.15% à 50/50). Il trade potentiellement à perte.
-2. **Source de prix sous-optimale** : `latestRoundData()` on-chain a un heartbeat d'~1h pour BTC/USD. Polymarket utilise Data Streams (sub-seconde), pas ce contrat.
-3. **Pas de filtre zone 50/50** : le bot peut trader quand les frais sont maximaux.
-4. **Vol statique** : la vol 5min est hardcodée à 0.12% au lieu d'être calculée dynamiquement.
-5. **Pas de logging CSV** : impossible de backtester sans données historiques.
-
-## Améliorations planifiées (TICKETS.md)
-
-Les tickets sont ordonnés par priorité et dépendances. Chaque ticket a des specs précises avec les fichiers à modifier, le code à ajouter, et les tests attendus.
-
-| Ticket | Description | Fichiers |
-|--------|-------------|----------|
-| T1 | Frais dynamiques dans evaluate() | strategy.rs, config.toml |
-| T2 | Query fee-rate API avant chaque trade | polymarket.rs, main.rs |
-| T3 | Filtre zone de prix (éviter 50/50) | strategy.rs, config.toml |
-| T4 | WebSocket exchanges (Binance+Coinbase+Kraken) | exchanges.rs (NOUVEAU), Cargo.toml |
-| T5 | Médiane multi-exchange dans evaluate() | main.rs, strategy.rs |
-| T6 | Volatilité dynamique (VolTracker) | strategy.rs, main.rs, config.toml |
-| T7 | Mode mixte Chainlink + exchanges WS | strategy.rs, main.rs, config.toml |
-| T8 | Logging CSV pour backtesting | logger.rs (NOUVEAU), main.rs |
-
-**Ordre d'exécution** : T1 → T3 → T2 → T4 → T5 → T6 → T7 → T8
-
-**Règle** : `cargo test` doit passer après chaque ticket.
+```
+timestamp, hour_utc, day_of_week, window, event, btc_start, btc_current, btc_resolution,
+price_change_pct, market_mid, implied_p_up, side, token, edge_brut_pct, edge_net_pct,
+fee_pct, size_usdc, entry_price, order_latency_ms, fill_type, remaining_s, num_ws_src,
+price_source, vol_pct, btc_1h_pct, btc_24h_pct, btc_24h_vol_m, funding_rate, spread,
+bid_depth, ask_depth, book_imbalance, best_bid, best_ask, mid_vs_entry_slippage_bps,
+bid_levels, ask_levels, micro_vol, momentum_ratio, sign_changes, max_drawdown_bps,
+time_above_start_s, ticks_count, result, pnl, session_pnl, session_trades,
+session_wr_pct, consecutive_wins, session_drawdown_pct, skip_reason
+```
 
 ## Contexte marché important
 
@@ -159,5 +228,7 @@ Format : `btc-updown-5m-{unix_timestamp_du_window}`
 - Logging : `tracing` (info/warn/error/debug), pas println
 - Async : `tokio` multi-thread, pas de `.block_on()`
 - Serde : `#[serde(rename_all = "camelCase")]` pour les réponses API Polymarket
-- Tests : dans `#[cfg(test)] mod tests` en bas de chaque fichier
+- Tests : dans `#[cfg(test)] mod tests` en bas de chaque fichier — 144 tests actuellement
 - Config : `serde::Deserialize` depuis `config.toml`, converteurs `From<>` vers les structs internes
+- NaN safety : `partial_cmp().unwrap_or(Ordering::Equal)` dans les sorts
+- Break-even (pnl == 0.0) traité comme une perte (reset win streak)
