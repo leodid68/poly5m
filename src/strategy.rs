@@ -23,6 +23,9 @@ pub struct StrategyConfig {
     pub min_payout_ratio: f64,
     pub min_book_imbalance: f64,
     pub max_vol_5min_pct: f64,
+    pub min_ws_sources: u32,
+    pub circuit_breaker_window: usize,
+    pub circuit_breaker_min_wr: f64,
 }
 
 /// Signal de trade émis par la stratégie.
@@ -37,24 +40,31 @@ pub struct Signal {
     pub price: f64,
 }
 
-/// État de la session (P&L, nombre de trades, bankroll tracking).
+/// État de la session (P&L, nombre de trades, bankroll tracking, circuit breaker).
 #[derive(Debug)]
 pub struct Session {
     pub pnl_usdc: f64,
     pub trades: u32,
     pub wins: u32,
     pub initial_bankroll: f64,
+    /// Rolling window of recent trade outcomes (true=win, false=loss) for circuit breaker.
+    recent_outcomes: VecDeque<bool>,
+    /// Timestamp (unix secs) when circuit breaker was triggered. 0 = not active.
+    pub circuit_breaker_until: u64,
 }
 
 impl Default for Session {
     fn default() -> Self {
-        Self { pnl_usdc: 0.0, trades: 0, wins: 0, initial_bankroll: 0.0 }
+        Self {
+            pnl_usdc: 0.0, trades: 0, wins: 0, initial_bankroll: 0.0,
+            recent_outcomes: VecDeque::new(), circuit_breaker_until: 0,
+        }
     }
 }
 
 impl Session {
     pub fn new(initial_bankroll: f64) -> Self {
-        Self { pnl_usdc: 0.0, trades: 0, wins: 0, initial_bankroll }
+        Self { initial_bankroll, ..Default::default() }
     }
 
     pub fn bankroll(&self) -> f64 {
@@ -64,13 +74,46 @@ impl Session {
     pub fn record_trade(&mut self, pnl: f64) {
         self.pnl_usdc += pnl;
         self.trades += 1;
-        if pnl > 0.0 {
+        let won = pnl > 0.0;
+        if won {
             self.wins += 1;
         }
+        self.recent_outcomes.push_back(won);
     }
 
     pub fn win_rate(&self) -> f64 {
         if self.trades == 0 { 0.0 } else { self.wins as f64 / self.trades as f64 }
+    }
+
+    /// Rolling win rate over the last `window` trades. Returns None if not enough trades.
+    pub fn rolling_wr(&self, window: usize) -> Option<f64> {
+        if window == 0 || self.recent_outcomes.len() < window {
+            return None;
+        }
+        let recent: Vec<_> = self.recent_outcomes.iter().rev().take(window).collect();
+        let wins = recent.iter().filter(|&&w| *w).count();
+        Some(wins as f64 / window as f64)
+    }
+
+    /// Check if circuit breaker should trigger. If rolling WR is below threshold, set cooldown.
+    pub fn check_circuit_breaker(&mut self, window: usize, min_wr: f64, cooldown_secs: u64, now: u64) {
+        if window == 0 || min_wr <= 0.0 {
+            return;
+        }
+        if let Some(wr) = self.rolling_wr(window) {
+            if wr < min_wr {
+                self.circuit_breaker_until = now + cooldown_secs;
+                tracing::warn!(
+                    "Circuit breaker triggered: rolling WR {:.0}% < {:.0}% over {} trades. Pausing until +{}s",
+                    wr * 100.0, min_wr * 100.0, window, cooldown_secs
+                );
+            }
+        }
+    }
+
+    /// Returns true if circuit breaker is active (should not trade).
+    pub fn is_circuit_broken(&self, now: u64) -> bool {
+        self.circuit_breaker_until > now
     }
 }
 
@@ -123,6 +166,7 @@ pub struct TradeContext {
     pub vol_5min_pct: f64,
     pub spread: f64,
     pub book_imbalance: f64,
+    pub num_ws_sources: u32,
 }
 
 /// Évalue si on doit trader sur cet intervalle.
@@ -137,6 +181,12 @@ pub fn evaluate(
         return None;
     }
     if session.pnl_usdc <= -config.session_loss_limit_usdc {
+        return None;
+    }
+
+    // 1b. Min WS sources — skip if not enough exchange feeds
+    if config.min_ws_sources > 0 && ctx.num_ws_sources < config.min_ws_sources {
+        tracing::debug!("Skip: {} WS sources < min {}", ctx.num_ws_sources, config.min_ws_sources);
         return None;
     }
 
@@ -372,6 +422,9 @@ mod tests {
             min_payout_ratio: 0.0,
             min_book_imbalance: 0.0,
             max_vol_5min_pct: 0.0,
+            min_ws_sources: 0,
+            circuit_breaker_window: 0,
+            circuit_breaker_min_wr: 0.0,
         }
     }
 
@@ -389,6 +442,7 @@ mod tests {
             vol_5min_pct: DEFAULT_VOL,
             spread: 0.0,
             book_imbalance: 0.5,
+            num_ws_sources: 3,
         }
     }
 
@@ -962,6 +1016,9 @@ mod tests {
             min_payout_ratio: 0.08,
             min_book_imbalance: 0.08,
             max_vol_5min_pct: 0.12,
+            min_ws_sources: 3,
+            circuit_breaker_window: 15,
+            circuit_breaker_min_wr: 0.25,
         }
     }
 
@@ -981,6 +1038,7 @@ mod tests {
             vol_5min_pct: 0.10,
             spread: 0.02,
             book_imbalance: 0.20,
+            num_ws_sources: 3,
         };
         let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_some(), "should trade with +0.03% at 10s");
@@ -1007,6 +1065,7 @@ mod tests {
             vol_5min_pct: 0.10,
             spread: 0.02,
             book_imbalance: 0.20,
+            num_ws_sources: 3,
         };
         let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_none(), "weak +0.005% should not pass 5% min edge");
@@ -1028,6 +1087,7 @@ mod tests {
             vol_5min_pct: 0.10,
             spread: 0.01,
             book_imbalance: 0.20,
+            num_ws_sources: 3,
         };
         let signal = evaluate(&ctx, &session, &config);
         if let Some(s) = signal {
@@ -1053,6 +1113,7 @@ mod tests {
             vol_5min_pct: 0.10,
             spread: 0.02,
             book_imbalance: 0.20,
+            num_ws_sources: 3,
         };
         let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_none(), "should stop after -$20 (50% of $40 portfolio)");
@@ -1075,6 +1136,7 @@ mod tests {
             vol_5min_pct: 0.10,
             spread: 0.20, // 10% spread cost → kills edge below 5%
             book_imbalance: 0.20,
+            num_ws_sources: 3,
         };
         let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_none(), "wide spread should kill the edge below 5% min");
@@ -1237,5 +1299,83 @@ mod tests {
         assert!(sig_high.is_some());
         assert!(sig_high.unwrap().size_usdc >= sig_low.unwrap().size_usdc,
             "higher imbalance should give equal or larger size");
+    }
+
+    // --- min_ws_sources ---
+
+    #[test]
+    fn evaluate_skips_few_ws_sources() {
+        let config = StrategyConfig { min_ws_sources: 3, ..test_config() };
+        let session = Session::new(40.0);
+        let ctx = TradeContext {
+            chainlink_price: 100_050.0,
+            num_ws_sources: 2,
+            ..test_ctx()
+        };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_none(), "should skip with only 2 WS sources");
+    }
+
+    #[test]
+    fn evaluate_passes_enough_ws_sources() {
+        let config = StrategyConfig { min_ws_sources: 3, ..test_config() };
+        let session = Session::new(40.0);
+        let ctx = TradeContext {
+            chainlink_price: 100_050.0,
+            num_ws_sources: 3,
+            ..test_ctx()
+        };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_some(), "should pass with 3 WS sources");
+    }
+
+    // --- circuit breaker ---
+
+    #[test]
+    fn rolling_wr_tracks_recent() {
+        let mut s = Session::new(40.0);
+        // 3 losses
+        for _ in 0..3 {
+            s.record_trade(-1.0);
+        }
+        assert_eq!(s.rolling_wr(3), Some(0.0));
+        // 1 win
+        s.record_trade(2.0);
+        // Last 3: L, L, W → 33%
+        let wr = s.rolling_wr(3).unwrap();
+        assert!((wr - 1.0 / 3.0).abs() < 0.01, "got {wr}");
+    }
+
+    #[test]
+    fn rolling_wr_none_when_not_enough() {
+        let mut s = Session::new(40.0);
+        s.record_trade(1.0);
+        s.record_trade(-1.0);
+        assert_eq!(s.rolling_wr(5), None);
+    }
+
+    #[test]
+    fn circuit_breaker_triggers() {
+        let mut s = Session::new(40.0);
+        // 15 trades: 3 wins, 12 losses → 20% WR < 25%
+        for i in 0..15 {
+            if i < 3 { s.record_trade(1.0); } else { s.record_trade(-1.0); }
+        }
+        assert!(!s.is_circuit_broken(1000));
+        s.check_circuit_breaker(15, 0.25, 1800, 1000);
+        assert!(s.is_circuit_broken(1000)); // active now
+        assert!(s.is_circuit_broken(2799)); // still active at 1000+1799
+        assert!(!s.is_circuit_broken(2800)); // expired at 1000+1800
+    }
+
+    #[test]
+    fn circuit_breaker_does_not_trigger_above_threshold() {
+        let mut s = Session::new(40.0);
+        // 15 trades: 5 wins, 10 losses → 33% WR > 25%
+        for i in 0..15 {
+            if i < 5 { s.record_trade(1.0); } else { s.record_trade(-1.0); }
+        }
+        s.check_circuit_breaker(15, 0.25, 1800, 1000);
+        assert!(!s.is_circuit_broken(1000));
     }
 }

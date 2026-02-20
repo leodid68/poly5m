@@ -21,7 +21,7 @@ min_shares = 5
 min_edge_pct = 1.0
 entry_seconds_before_end = 30
 min_delta_pct = 0.005
-max_spread = 0.0
+max_spread = 0.03
 session_profit_target_usdc = 500.0
 session_loss_limit_usdc = 500.0
 fee_rate = 0.25
@@ -38,6 +38,9 @@ vol_confidence_multiplier = 2.5
 min_payout_ratio = 0.08
 min_book_imbalance = 0.08
 max_vol_5min_pct = 0.12
+min_ws_sources = 3
+circuit_breaker_window = 15
+circuit_breaker_min_wr = 0.25
 
 [rtds]
 enabled = true

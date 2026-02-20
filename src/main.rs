@@ -130,6 +130,12 @@ struct StrategyToml {
     min_book_imbalance: f64,
     #[serde(default)]
     max_vol_5min_pct: f64,
+    #[serde(default)]
+    min_ws_sources: u32,
+    #[serde(default = "default_circuit_breaker_window")]
+    circuit_breaker_window: usize,
+    #[serde(default)]
+    circuit_breaker_min_wr: f64,
 }
 
 fn default_min_bet_usdc() -> f64 { 1.0 }
@@ -146,6 +152,7 @@ fn default_max_spread() -> f64 { 0.0 }
 fn default_kelly_fraction() -> f64 { 0.25 }
 fn default_initial_bankroll() -> f64 { 40.0 }
 fn default_vol_confidence_multiplier() -> f64 { 1.0 }
+fn default_circuit_breaker_window() -> usize { 0 }
 
 impl From<StrategyToml> for strategy::StrategyConfig {
     fn from(s: StrategyToml) -> Self {
@@ -169,6 +176,9 @@ impl From<StrategyToml> for strategy::StrategyConfig {
             min_payout_ratio: s.min_payout_ratio,
             min_book_imbalance: s.min_book_imbalance,
             max_vol_5min_pct: s.max_vol_5min_pct,
+            min_ws_sources: s.min_ws_sources,
+            circuit_breaker_window: s.circuit_breaker_window,
+            circuit_breaker_min_wr: s.circuit_breaker_min_wr,
         }
     }
 }
@@ -360,6 +370,13 @@ async fn main() -> Result<()> {
                     csv.log_resolution(now, current_window, bet.start_price, current_btc,
                         result_str, pnl, session.pnl_usdc, session.trades, session.win_rate() * 100.0);
                 }
+                // Check circuit breaker after each resolution
+                session.check_circuit_breaker(
+                    strat_config.circuit_breaker_window,
+                    strat_config.circuit_breaker_min_wr,
+                    1800, // 30 min cooldown
+                    now,
+                );
             }
 
             // Enregistrer le mouvement de l'intervalle précédent pour la vol dynamique
@@ -389,6 +406,14 @@ async fn main() -> Result<()> {
 
         if traded_this_window { continue; }
         if remaining > strat_config.entry_seconds_before_end { continue; }
+
+        // Circuit breaker — skip trading during cooldown
+        if session.is_circuit_broken(now) {
+            if skip_reason == "no_entry" {
+                skip_reason = String::from("circuit_breaker");
+            }
+            continue;
+        }
 
         // Fetch Chainlink independently for divergence check (even if WS is primary)
         let cl_price = match fetch_racing(&providers, feed).await {
@@ -452,6 +477,7 @@ async fn main() -> Result<()> {
             vol_5min_pct: vol_tracker.current_vol(),
             spread: spread_book.spread,
             book_imbalance: spread_book.imbalance,
+            num_ws_sources: u32::from(num_ws),
         };
         let signal = match strategy::evaluate(&ctx, &session, &strat_config) {
             Some(s) => s,
@@ -459,7 +485,9 @@ async fn main() -> Result<()> {
                 // Track skip reason pour le CSV
                 let price_change_pct = ((current_btc - start_price) / start_price * 100.0).abs();
                 let vol = vol_tracker.current_vol();
-                if strat_config.max_vol_5min_pct > 0.0 && vol > strat_config.max_vol_5min_pct {
+                if strat_config.min_ws_sources > 0 && u32::from(num_ws) < strat_config.min_ws_sources {
+                    skip_reason = format!("ws_src<{}", strat_config.min_ws_sources);
+                } else if strat_config.max_vol_5min_pct > 0.0 && vol > strat_config.max_vol_5min_pct {
                     skip_reason = format!("vol>{:.3}%", strat_config.max_vol_5min_pct);
                 } else if market_up_price < strat_config.min_market_price {
                     skip_reason = format!("mid<{:.2}", strat_config.min_market_price);
