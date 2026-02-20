@@ -20,6 +20,7 @@ rand = "0.9"
 futures = "0.3"
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 atty = "0.2"
+statrs = "0.18"
 
 [profile.release]
 opt-level = 3

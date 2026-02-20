@@ -36,7 +36,6 @@ pub struct StrategyConfig {
     pub max_consecutive_losses: u32,
     /// Degrees of freedom for Student-t CDF (0.0 = use normal CDF).
     /// Lower df = heavier tails = more conservative. Recommended: 4.0.
-    #[allow(dead_code)] // Used in Task 2 (Student-t CDF logic)
     pub student_t_df: f64,
 }
 
@@ -235,7 +234,7 @@ pub fn evaluate(
         .unwrap_or(ctx.chainlink_price);
     let price_change_pct = (current_price - ctx.start_price) / ctx.start_price * 100.0;
 
-    let true_up_prob = price_change_to_probability(price_change_pct, ctx.seconds_remaining, ctx.vol_5min_pct, config.vol_confidence_multiplier, ctx.book_imbalance);
+    let true_up_prob = price_change_to_probability(price_change_pct, ctx.seconds_remaining, ctx.vol_5min_pct, config.vol_confidence_multiplier, ctx.book_imbalance, config.student_t_df);
     let true_down_prob = 1.0 - true_up_prob;
     let market_down_price = 1.0 - ctx.market_up_price;
 
@@ -399,20 +398,24 @@ pub fn dynamic_fee(price: f64, fee_rate: f64) -> f64 {
 /// Calcule un z-score à partir du mouvement de prix et de la vol résiduelle,
 /// puis le pondère par le book imbalance (>0.5 = pression acheteuse, <0.5 = vendeuse).
 /// L'imbalance amplifie le signal prix existant (ne crée pas de signal à z≈0).
-fn price_change_to_probability(pct_change: f64, seconds_remaining: u64, vol_5min_pct: f64, confidence_multiplier: f64, book_imbalance: f64) -> f64 {
+fn price_change_to_probability(pct_change: f64, seconds_remaining: u64, vol_5min_pct: f64, confidence_multiplier: f64, book_imbalance: f64, student_t_df: f64) -> f64 {
     let remaining_vol = vol_5min_pct * confidence_multiplier * ((seconds_remaining as f64) / 300.0).sqrt();
 
     if remaining_vol < 1e-9 {
-        // Quasi plus de temps — direction verrouillée
         return if pct_change > 0.0 { 1.0 } else if pct_change < 0.0 { 0.0 } else { 0.5 };
     }
 
-    // z-score : avance actuelle / vol résiduelle
     let z = pct_change / remaining_vol;
     let imbalance_signal = (book_imbalance - 0.5).clamp(-0.4, 0.4);
     let z_combined = z * 0.6 + imbalance_signal * z.signum() * 2.5;
 
-    normal_cdf(z_combined)
+    if student_t_df > 0.0 {
+        use statrs::distribution::{StudentsT, ContinuousCDF};
+        let dist = StudentsT::new(0.0, 1.0, student_t_df).unwrap();
+        dist.cdf(z_combined)
+    } else {
+        normal_cdf(z_combined)
+    }
 }
 
 /// Approximation de la CDF normale (Abramowitz & Stegun, erreur max 1.5e-7).
@@ -500,33 +503,33 @@ mod tests {
 
     #[test]
     fn prob_positive_move_low_time() {
-        let p = price_change_to_probability(0.05, 5, DEFAULT_VOL, 1.0, 0.5);
+        let p = price_change_to_probability(0.05, 5, DEFAULT_VOL, 1.0, 0.5, 0.0);
         assert!(p > 0.80, "got {p}");
     }
 
     #[test]
     fn prob_positive_move_high_time() {
-        let p = price_change_to_probability(0.05, 60, DEFAULT_VOL, 1.0, 0.5);
+        let p = price_change_to_probability(0.05, 60, DEFAULT_VOL, 1.0, 0.5, 0.0);
         assert!(p > 0.5 && p < 0.95, "got {p}");
     }
 
     #[test]
     fn prob_flat() {
-        let p = price_change_to_probability(0.0, 30, DEFAULT_VOL, 1.0, 0.5);
+        let p = price_change_to_probability(0.0, 30, DEFAULT_VOL, 1.0, 0.5, 0.0);
         assert!((p - 0.5).abs() < 0.001, "got {p}");
     }
 
     #[test]
     fn prob_negative_move() {
-        let p = price_change_to_probability(-0.05, 10, DEFAULT_VOL, 1.0, 0.5);
+        let p = price_change_to_probability(-0.05, 10, DEFAULT_VOL, 1.0, 0.5, 0.0);
         assert!(p < 0.2, "got {p}");
     }
 
     #[test]
     fn prob_zero_time_locks_direction() {
-        assert!(price_change_to_probability(0.01, 0, DEFAULT_VOL, 1.0, 0.5) == 1.0);
-        assert!(price_change_to_probability(-0.01, 0, DEFAULT_VOL, 1.0, 0.5) == 0.0);
-        assert!(price_change_to_probability(0.0, 0, DEFAULT_VOL, 1.0, 0.5) == 0.5);
+        assert!(price_change_to_probability(0.01, 0, DEFAULT_VOL, 1.0, 0.5, 0.0) == 1.0);
+        assert!(price_change_to_probability(-0.01, 0, DEFAULT_VOL, 1.0, 0.5, 0.0) == 0.0);
+        assert!(price_change_to_probability(0.0, 0, DEFAULT_VOL, 1.0, 0.5, 0.0) == 0.5);
     }
 
     // --- fractional_kelly ---
@@ -1242,8 +1245,8 @@ mod tests {
     #[test]
     fn confidence_multiplier_reduces_probability() {
         // Same move, higher multiplier → less confident (closer to 0.5)
-        let p_low = price_change_to_probability(0.05, 10, DEFAULT_VOL, 1.0, 0.5);
-        let p_high = price_change_to_probability(0.05, 10, DEFAULT_VOL, 2.5, 0.5);
+        let p_low = price_change_to_probability(0.05, 10, DEFAULT_VOL, 1.0, 0.5, 0.0);
+        let p_high = price_change_to_probability(0.05, 10, DEFAULT_VOL, 2.5, 0.5, 0.0);
         assert!(p_high < p_low, "multiplier should reduce confidence: {p_high} vs {p_low}");
         assert!(p_high > 0.5, "should still lean UP: {p_high}");
     }
@@ -1580,29 +1583,53 @@ mod tests {
 
     #[test]
     fn hybrid_imbalance_confirms_direction_increases_prob() {
-        let neutral = price_change_to_probability(0.05, 10, 0.12, 1.0, 0.5);
-        let confirming = price_change_to_probability(0.05, 10, 0.12, 1.0, 0.8);
+        let neutral = price_change_to_probability(0.05, 10, 0.12, 1.0, 0.5, 0.0);
+        let confirming = price_change_to_probability(0.05, 10, 0.12, 1.0, 0.8, 0.0);
         assert!(confirming > neutral,
             "confirming imbalance should increase prob: {confirming} vs {neutral}");
     }
 
     #[test]
     fn hybrid_imbalance_contradicts_direction_decreases_prob() {
-        let neutral = price_change_to_probability(0.05, 10, 0.12, 1.0, 0.5);
-        let contradicting = price_change_to_probability(0.05, 10, 0.12, 1.0, 0.2);
+        let neutral = price_change_to_probability(0.05, 10, 0.12, 1.0, 0.5, 0.0);
+        let contradicting = price_change_to_probability(0.05, 10, 0.12, 1.0, 0.2, 0.0);
         assert!(contradicting < neutral,
             "contradicting imbalance should decrease prob: {contradicting} vs {neutral}");
     }
 
     #[test]
     fn hybrid_neutral_imbalance_close_to_original() {
-        let p = price_change_to_probability(0.05, 10, 0.12, 1.0, 0.5);
+        let p = price_change_to_probability(0.05, 10, 0.12, 1.0, 0.5, 0.0);
         assert!(p > 0.5, "UP move with neutral imbalance should still lean UP: {p}");
     }
 
     #[test]
     fn hybrid_imbalance_clamped() {
-        let p = price_change_to_probability(0.05, 10, 0.12, 1.0, 1.0);
+        let p = price_change_to_probability(0.05, 10, 0.12, 1.0, 1.0, 0.0);
         assert!(p > 0.5 && p <= 1.0, "extreme imbalance should still be valid prob: {p}");
+    }
+
+    #[test]
+    fn student_t_more_conservative_than_normal() {
+        let p_normal = price_change_to_probability(0.05, 10, 0.12, 1.0, 0.5, 0.0);
+        let p_student = price_change_to_probability(0.05, 10, 0.12, 1.0, 0.5, 4.0);
+        assert!(p_student < p_normal,
+            "Student-t should be more conservative: {p_student} vs normal {p_normal}");
+        assert!(p_student > 0.5, "should still lean UP: {p_student}");
+    }
+
+    #[test]
+    fn student_t_df_zero_uses_normal() {
+        let p_zero = price_change_to_probability(0.05, 10, 0.12, 1.0, 0.5, 0.0);
+        let p_normal = price_change_to_probability(0.05, 10, 0.12, 1.0, 0.5, 0.0);
+        assert!((p_zero - p_normal).abs() < 1e-10);
+    }
+
+    #[test]
+    fn student_t_symmetric() {
+        let p_up = price_change_to_probability(0.05, 10, 0.12, 1.0, 0.5, 4.0);
+        let p_down = price_change_to_probability(-0.05, 10, 0.12, 1.0, 0.5, 4.0);
+        assert!((p_up + p_down - 1.0).abs() < 0.01,
+            "should be symmetric: p_up={p_up} p_down={p_down}");
     }
 }
