@@ -398,6 +398,8 @@ async fn main() -> Result<()> {
     let mut pending_bet: Option<PendingBet> = None;
     let mut last_mid = 0.0f64;
     let mut skip_reason = String::from("startup");
+    #[allow(unused_assignments)]
+    let mut prev_price_source = "CL";
     let mut macro_ctx = macro_data::MacroData::default();
     let mut window_ticks = strategy::WindowTicks::new();
     let mut calibrator = strategy::Calibrator::new(200);
@@ -449,6 +451,7 @@ async fn main() -> Result<()> {
         };
 
         let price_source = if rtds_price.is_some() { "RTDS" } else if ws_price.is_some() { "WS" } else { "CL" };
+        prev_price_source = price_source;
 
         window_ticks.tick(current_btc, now * 1000);
 
@@ -461,7 +464,7 @@ async fn main() -> Result<()> {
             // Log skip si le window précédent n'a pas donné de trade
             if current_window > 0 && !traded_this_window {
                 if let Some(ref mut csv) = csv {
-                    csv.log_skip(now, current_window, start_price, current_btc, last_mid, num_ws, price_source, vol_tracker.current_vol(), &macro_ctx, &skip_reason);
+                    csv.log_skip(now, current_window, start_price, current_btc, last_mid, num_ws, prev_price_source, vol_tracker.current_vol(), &macro_ctx, &skip_reason);
                 }
             }
 
@@ -632,26 +635,9 @@ async fn main() -> Result<()> {
             side_label, token_label, signal.size_usdc, entry_price, current_btc,
             book.spread, book.imbalance,
         );
-        if let Some(ref mut csv) = csv {
-            csv.log_trade(
-                now, current_window, start_price, current_btc,
-                market_up_price, signal.implied_p_up, side_label, token_label,
-                signal.edge_brut_pct, signal.edge_pct, signal.fee_pct,
-                signal.size_usdc, entry_price,
-                0, if dry_run { "dry_run" } else if order_type == "GTC" { "GTC_filled" } else { "FOK_filled" },
-                remaining, num_ws, price_source, vol_tracker.current_vol(),
-                &macro_ctx, book.spread, book.bid_depth_usdc, book.ask_depth_usdc,
-                book.imbalance, book.best_bid, book.best_ask,
-                book.num_bid_levels, book.num_ask_levels,
-                window_ticks.micro_vol(), window_ticks.momentum_ratio(),
-                window_ticks.sign_changes(), window_ticks.max_drawdown_bps(),
-                window_ticks.time_at_extreme_s(start_price), window_ticks.ticks_count(),
-                session.pnl_usdc, session.trades, session.win_rate() * 100.0,
-                session.consecutive_wins, session.session_drawdown_pct(),
-            );
-        }
-
-        if dry_run {
+        // Execute order first, then log with actual latency and fill_type
+        let order_start = Instant::now();
+        let (order_ok, fill_type) = if dry_run {
             pending_bet = Some(PendingBet {
                 start_price,
                 side: signal.side,
@@ -659,13 +645,15 @@ async fn main() -> Result<()> {
                 entry_price,
                 fee_pct: signal.fee_pct,
             });
-            traded_this_window = true;
+            (true, "dry_run")
         } else if let Some(ref poly) = poly {
             if let Some(bet) = execute_order(
                 poly, token_id, &signal, entry_price, start_price,
                 fee_rate_bps, &order_type, maker_timeout_s,
             ).await {
                 pending_bet = Some(bet);
+                let ft = if order_type == "GTC" { "GTC_filled" } else { "FOK_filled" };
+                (true, ft)
             } else {
                 let reason = if order_type == "GTC" { "gtc_not_filled" } else { "fok_rejected" };
                 tracing::warn!("Ordre {reason} — loggé comme skip");
@@ -673,9 +661,35 @@ async fn main() -> Result<()> {
                     csv.log_skip(now, current_window, start_price, current_btc,
                         market_up_price, num_ws, price_source, vol_tracker.current_vol(), &macro_ctx, reason);
                 }
+                (false, "rejected")
             }
-            traded_this_window = true;
+        } else {
+            (false, "no_client")
+        };
+        let order_latency_ms = order_start.elapsed().as_millis() as u64;
+
+        // Only log trade row when order actually succeeded (no phantom rows)
+        if order_ok {
+            if let Some(ref mut csv) = csv {
+                csv.log_trade(
+                    now, current_window, start_price, current_btc,
+                    market_up_price, signal.implied_p_up, side_label, token_label,
+                    signal.edge_brut_pct, signal.edge_pct, signal.fee_pct,
+                    signal.size_usdc, entry_price,
+                    order_latency_ms, fill_type,
+                    remaining, num_ws, price_source, vol_tracker.current_vol(),
+                    &macro_ctx, book.spread, book.bid_depth_usdc, book.ask_depth_usdc,
+                    book.imbalance, book.best_bid, book.best_ask,
+                    book.num_bid_levels, book.num_ask_levels,
+                    window_ticks.micro_vol(), window_ticks.momentum_ratio(),
+                    window_ticks.sign_changes(), window_ticks.max_drawdown_bps(),
+                    window_ticks.time_above_start_s(start_price), window_ticks.ticks_count(),
+                    session.pnl_usdc, session.trades, session.win_rate() * 100.0,
+                    session.consecutive_wins, session.session_drawdown_pct(),
+                );
+            }
         }
+        traded_this_window = true;
     }
 
     // Résumé de session

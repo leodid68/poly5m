@@ -11,7 +11,7 @@ impl CsvLogger {
     pub fn new(path: &str) -> Result<Self> {
         let file = File::create(path).context("Cannot create CSV log file")?;
         let mut writer = BufWriter::new(file);
-        writeln!(writer, "timestamp,hour_utc,day_of_week,window,event,btc_start,btc_current,btc_resolution,price_change_pct,market_mid,implied_p_up,side,token,edge_brut_pct,edge_net_pct,fee_pct,size_usdc,entry_price,order_latency_ms,fill_type,remaining_s,num_ws_src,price_source,vol_pct,btc_1h_pct,btc_24h_pct,btc_24h_vol_m,funding_rate,spread,bid_depth,ask_depth,book_imbalance,best_bid,best_ask,mid_vs_entry_slippage_bps,bid_levels,ask_levels,micro_vol,momentum_ratio,sign_changes,max_drawdown_bps,time_at_extreme_s,ticks_count,result,pnl,session_pnl,session_trades,session_wr_pct,consecutive_wins,session_drawdown_pct,skip_reason")?;
+        writeln!(writer, "timestamp,hour_utc,day_of_week,window,event,btc_start,btc_current,btc_resolution,price_change_pct,market_mid,implied_p_up,side,token,edge_brut_pct,edge_net_pct,fee_pct,size_usdc,entry_price,order_latency_ms,fill_type,remaining_s,num_ws_src,price_source,vol_pct,btc_1h_pct,btc_24h_pct,btc_24h_vol_m,funding_rate,spread,bid_depth,ask_depth,book_imbalance,best_bid,best_ask,mid_vs_entry_slippage_bps,bid_levels,ask_levels,micro_vol,momentum_ratio,sign_changes,max_drawdown_bps,time_above_start_s,ticks_count,result,pnl,session_pnl,session_trades,session_wr_pct,consecutive_wins,session_drawdown_pct,skip_reason")?;
         writer.flush()?;
         Ok(Self { writer })
     }
@@ -52,7 +52,7 @@ impl CsvLogger {
         momentum_ratio: f64,
         sign_changes: u32,
         max_drawdown_bps: f64,
-        time_at_extreme_s: u64,
+        time_above_start_s: u64,
         ticks_count: u32,
         session_pnl: f64,
         session_trades: u32,
@@ -75,7 +75,7 @@ impl CsvLogger {
              {spread:.4},{bid_depth:.2},{ask_depth:.2},{imbalance:.4},\
              {best_bid:.4},{best_ask:.4},{slippage_bps:.2},\
              {bid_levels},{ask_levels},{micro_vol:.4},{momentum_ratio:.4},\
-             {sign_changes},{max_drawdown_bps:.2},{time_at_extreme_s},{ticks_count},\
+             {sign_changes},{max_drawdown_bps:.2},{time_above_start_s},{ticks_count},\
              ,,{session_pnl:.4},{session_trades},{session_wr:.1},{consecutive_wins},{session_drawdown_pct:.2},",
             macro_data.btc_1h_pct, macro_data.btc_24h_pct, macro_data.btc_24h_vol_m, macro_data.funding_rate,
         ).and_then(|_| self.writer.flush()) {
@@ -306,7 +306,7 @@ mod tests {
         assert!(lines[0].contains(",micro_vol,momentum_ratio,"));
         assert!(lines[0].contains(",order_latency_ms,fill_type,"));
         assert!(lines[0].contains(",best_bid,best_ask,mid_vs_entry_slippage_bps,"));
-        assert!(lines[0].contains(",sign_changes,max_drawdown_bps,time_at_extreme_s,ticks_count,"));
+        assert!(lines[0].contains(",sign_changes,max_drawdown_bps,time_above_start_s,ticks_count,"));
         assert!(lines[0].contains(",consecutive_wins,session_drawdown_pct,skip_reason"));
         assert!(lines[1].contains(",trade,"));
         assert!(lines[1].contains("BUY_UP"));
