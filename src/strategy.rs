@@ -174,6 +174,60 @@ impl VolTracker {
     }
 }
 
+/// Buffer de prix intra-window pour le regime detection.
+/// Collecte les ticks pendant une fenêtre 5min et calcule micro-vol + momentum.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct WindowTicks {
+    prices: Vec<f64>,
+}
+
+#[allow(dead_code)]
+impl WindowTicks {
+    pub fn new() -> Self {
+        Self { prices: Vec::with_capacity(3200) }
+    }
+
+    pub fn tick(&mut self, price: f64) {
+        self.prices.push(price);
+    }
+
+    pub fn clear(&mut self) {
+        self.prices.clear();
+    }
+
+    /// Micro-volatility: std dev of tick-to-tick log-returns (%).
+    /// High = choppy, low = directional.
+    pub fn micro_vol(&self) -> f64 {
+        if self.prices.len() < 3 {
+            return 0.0;
+        }
+        let returns: Vec<f64> = self.prices.windows(2)
+            .map(|w| (w[1] / w[0]).ln() * 100.0)
+            .collect();
+        let n = returns.len() as f64;
+        let mean = returns.iter().sum::<f64>() / n;
+        let variance = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (n - 1.0);
+        variance.sqrt()
+    }
+
+    /// Momentum consistency: ratio of dominant direction ticks.
+    /// \>0.7 = directional, <0.55 = choppy/oscillating.
+    /// Returns 1.0 (favorable) if not enough data.
+    pub fn momentum_ratio(&self) -> f64 {
+        if self.prices.len() < 3 {
+            return 1.0;
+        }
+        let up = self.prices.windows(2).filter(|w| w[1] > w[0]).count();
+        let down = self.prices.windows(2).filter(|w| w[1] < w[0]).count();
+        let total = up + down;
+        if total == 0 {
+            return 1.0;
+        }
+        up.max(down) as f64 / total as f64
+    }
+}
+
 /// Market context for trade evaluation.
 #[derive(Debug, Clone)]
 pub struct TradeContext {
@@ -1631,5 +1685,64 @@ mod tests {
         let p_down = price_change_to_probability(-0.05, 10, 0.12, 1.0, 0.5, 4.0);
         assert!((p_up + p_down - 1.0).abs() < 0.01,
             "should be symmetric: p_up={p_up} p_down={p_down}");
+    }
+
+    #[test]
+    fn window_ticks_micro_vol_directional() {
+        let mut wt = WindowTicks::new();
+        for i in 0..5 {
+            wt.tick(100.0 + i as f64);
+        }
+        let mv = wt.micro_vol();
+        assert!(mv > 0.0, "micro_vol should be positive: {mv}");
+    }
+
+    #[test]
+    fn window_ticks_micro_vol_choppy_higher() {
+        let mut dir = WindowTicks::new();
+        let mut chop = WindowTicks::new();
+        for i in 0..20 {
+            dir.tick(100.0 + i as f64 * 0.5);
+        }
+        for i in 0..20 {
+            chop.tick(if i % 2 == 0 { 100.0 } else { 101.0 });
+        }
+        assert!(chop.micro_vol() > dir.micro_vol(),
+            "choppy should have higher micro_vol: {} vs {}", chop.micro_vol(), dir.micro_vol());
+    }
+
+    #[test]
+    fn window_ticks_momentum_ratio_directional() {
+        let mut wt = WindowTicks::new();
+        for i in 0..10 {
+            wt.tick(100.0 + i as f64);
+        }
+        let mr = wt.momentum_ratio();
+        assert!(mr > 0.8, "directional should have high momentum: {mr}");
+    }
+
+    #[test]
+    fn window_ticks_momentum_ratio_choppy() {
+        let mut wt = WindowTicks::new();
+        for i in 0..10 {
+            wt.tick(if i % 2 == 0 { 100.0 } else { 101.0 });
+        }
+        let mr = wt.momentum_ratio();
+        assert!(mr < 0.6, "choppy should have low momentum: {mr}");
+    }
+
+    #[test]
+    fn window_ticks_empty_defaults() {
+        let wt = WindowTicks::new();
+        assert!(wt.micro_vol() == 0.0);
+        assert!(wt.momentum_ratio() == 1.0);
+    }
+
+    #[test]
+    fn window_ticks_single_price_defaults() {
+        let mut wt = WindowTicks::new();
+        wt.tick(100.0);
+        assert!(wt.micro_vol() == 0.0);
+        assert!(wt.momentum_ratio() == 1.0);
     }
 }
