@@ -149,7 +149,43 @@ struct StrategyToml {
     min_z_score: f64,
     #[serde(default = "default_max_model_divergence")]
     max_model_divergence: f64,
+    #[serde(default)]
+    extreme: ExtremeToml,
 }
+
+#[derive(Deserialize, Default)]
+struct ExtremeToml {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_extreme_min_velocity")]
+    min_velocity: f64,
+    #[serde(default = "default_extreme_max_decay_ratio")]
+    max_decay_ratio: f64,
+    #[serde(default = "default_extreme_max_mid_movement")]
+    max_mid_movement: f64,
+    #[serde(default = "default_extreme_min_edge")]
+    min_edge: f64,
+    #[serde(default = "default_extreme_max_bet")]
+    max_bet: f64,
+    #[serde(default = "default_extreme_entry_seconds")]
+    entry_seconds_before_end: u64,
+    #[serde(default = "default_extreme_min_remaining")]
+    min_remaining_seconds: u64,
+    #[serde(default = "default_extreme_min_mid")]
+    min_mid_extreme: f64,
+    #[serde(default = "default_extreme_kelly")]
+    kelly_fraction: f64,
+}
+
+fn default_extreme_min_velocity() -> f64 { 0.003 }
+fn default_extreme_max_decay_ratio() -> f64 { 0.7 }
+fn default_extreme_max_mid_movement() -> f64 { 0.03 }
+fn default_extreme_min_edge() -> f64 { 0.03 }
+fn default_extreme_max_bet() -> f64 { 2.0 }
+fn default_extreme_entry_seconds() -> u64 { 30 }
+fn default_extreme_min_remaining() -> u64 { 5 }
+fn default_extreme_min_mid() -> f64 { 0.85 }
+fn default_extreme_kelly() -> f64 { 0.03 }
 
 fn default_min_bet_usdc() -> f64 { 1.0 }
 fn default_min_shares() -> u64 { 5 }
@@ -202,6 +238,18 @@ impl From<StrategyToml> for strategy::StrategyConfig {
             student_t_df: s.student_t_df,
             min_z_score: s.min_z_score,
             max_model_divergence: s.max_model_divergence,
+            extreme: strategy::ExtremeConfig {
+                enabled: s.extreme.enabled,
+                min_velocity: s.extreme.min_velocity,
+                max_decay_ratio: s.extreme.max_decay_ratio,
+                max_mid_movement: s.extreme.max_mid_movement,
+                min_edge: s.extreme.min_edge,
+                max_bet: s.extreme.max_bet,
+                entry_seconds_before_end: s.extreme.entry_seconds_before_end,
+                min_remaining_seconds: s.extreme.min_remaining_seconds,
+                min_mid_extreme: s.extreme.min_mid_extreme,
+                kelly_fraction: s.extreme.kelly_fraction,
+            },
         }
     }
 }
@@ -410,6 +458,8 @@ async fn main() -> Result<()> {
     let mut prev_price_source = "CL";
     let mut macro_ctx = macro_data::MacroData::default();
     let mut window_ticks = strategy::WindowTicks::new();
+    let mut mid_history: Vec<f64> = Vec::new();
+    let mut reversal_detected_this_window = false;
     let mut calibrator = strategy::Calibrator::new(200);
     calibrator.set_current_vcm(strat_config.vol_confidence_multiplier);
 
@@ -495,14 +545,23 @@ async fn main() -> Result<()> {
             if current_window > 0 && start_price > 0.0 {
                 vol_tracker.record_move(start_price, current_btc);
                 if let Some(ref mut oc) = outcome_csv {
-                    oc.log_outcome(current_window, start_price, current_btc);
+                    oc.log_outcome(
+                        current_window, start_price, current_btc,
+                        window_ticks.peak_delta_pct(start_price),
+                        window_ticks.velocity_pct_per_s(5),
+                        window_ticks.ticks_count(),
+                        last_mid,
+                        reversal_detected_this_window,
+                    );
                 }
             }
 
             current_window = window;
             traded_this_window = false;
+            reversal_detected_this_window = false;
             start_price = current_btc;
             window_ticks.clear();
+            mid_history.clear();
             // Pre-fetch market for the new window (saves ~200ms during entry)
             cached_market = if let Some(ref poly) = poly {
                 match poly.find_5min_btc_market(window).await {
@@ -535,7 +594,12 @@ async fn main() -> Result<()> {
         }
 
         if traded_this_window { continue; }
-        if remaining > strat_config.entry_seconds_before_end { continue; }
+
+        // Dual-mode entry window: extreme mode (t-30s→t-0s) + standard mode (t-entry_s→t-0s)
+        let extreme_window = strat_config.extreme.enabled
+            && remaining <= strat_config.extreme.entry_seconds_before_end;
+        let standard_window = remaining <= strat_config.entry_seconds_before_end;
+        if !extreme_window && !standard_window { continue; }
 
         // Circuit breaker — skip trading during cooldown
         if session.is_circuit_broken(now) {
@@ -580,29 +644,87 @@ async fn main() -> Result<()> {
         let spread_book = market_data.book;
 
         last_mid = market_up_price;
+        mid_history.push(market_up_price);
+        // Keep last ~6 entries (one per ~5s refresh)
+        if mid_history.len() > 6 {
+            mid_history.remove(0);
+        }
 
         tracing::debug!(
             "Fee check: API bps={} | calc={:.4}% | mid={:.4}",
             fee_rate_bps, strategy::dynamic_fee(market_up_price, strat_config.fee_rate) * 100.0, market_up_price
         );
 
-        // evaluate() : RTDS for probability model (settlement price), CL/WS for divergence
-        let ctx = strategy::TradeContext {
-            start_price,
-            chainlink_price: cl_price.unwrap_or(current_btc),
-            exchange_price: ws_price,
-            rtds_price,
-            market_up_price,
-            seconds_remaining: remaining,
-            fee_rate: strat_config.fee_rate,
-            vol_5min_pct: vol_tracker.current_vol(),
-            spread: spread_book.spread,
-            book_imbalance: spread_book.imbalance,
-            num_ws_sources: u32::from(num_ws),
-            micro_vol: window_ticks.micro_vol(),
-            momentum_ratio: window_ticks.momentum_ratio(),
+        // --- Tick freshness (shared by standard + extreme) ---
+        // Use best available source: WS timestamp if active, else RTDS is guaranteed
+        // fresh (<5s) by its staleness filter, else Chainlink-only = no freshness data.
+        let last_tick_age_ms = if let Some(a) = ws_agg.filter(|a| a.num_sources > 0) {
+            let now_ms = now * 1000;
+            now_ms.saturating_sub(a.last_update_ms)
+        } else if rtds_price.is_some() {
+            // RTDS latest() already filters stale data (>5s), so if we have a price it's fresh
+            0
+        } else {
+            // Chainlink-only: no sub-second freshness info, signal as potentially stale
+            10_000
         };
-        let signal = match strategy::evaluate(&ctx, &session, &strat_config) {
+
+        // --- Determine which signal to use ---
+        let mut signal: Option<strategy::Signal> = None;
+        let mut is_extreme_trade = false;
+
+        // Standard evaluation (only during standard window)
+        if standard_window {
+            let is_maker = order_type == "GTC";
+            let ctx = strategy::TradeContext {
+                start_price,
+                chainlink_price: cl_price.unwrap_or(current_btc),
+                exchange_price: ws_price,
+                rtds_price,
+                market_up_price,
+                seconds_remaining: remaining,
+                fee_rate: strat_config.fee_rate,
+                vol_5min_pct: vol_tracker.current_vol(),
+                spread: spread_book.spread,
+                book_imbalance: spread_book.imbalance,
+                num_ws_sources: u32::from(num_ws),
+                micro_vol: window_ticks.micro_vol(),
+                momentum_ratio: window_ticks.momentum_ratio(),
+                is_maker,
+                last_tick_age_ms,
+            };
+            signal = strategy::evaluate(&ctx, &session, &strat_config);
+        }
+
+        // Extreme evaluation (fallback if no standard signal, or exclusive during extreme-only window)
+        // Skip if tick data is stale (>5s) — reversal detection needs fresh prices
+        if signal.is_none() && extreme_window && last_tick_age_ms <= 5000 {
+            if let Some(ext_sig) = strategy::evaluate_extreme(
+                start_price,
+                market_up_price,
+                remaining,
+                vol_tracker.current_vol(),
+                &window_ticks,
+                &mid_history,
+                &session,
+                &strat_config,
+            ) {
+                // Convert ExtremeSignal to Signal for unified order execution
+                signal = Some(strategy::Signal {
+                    side: ext_sig.side,
+                    edge_pct: ext_sig.contrarian_edge * 100.0,
+                    edge_brut_pct: ext_sig.contrarian_edge * 100.0,
+                    fee_pct: 0.0, // extreme zones have near-zero fees, use FOK
+                    implied_p_up: ext_sig.implied_p_up,
+                    size_usdc: ext_sig.size_usdc,
+                    price: ext_sig.contrarian_price,
+                });
+                is_extreme_trade = true;
+                reversal_detected_this_window = true;
+            }
+        }
+
+        let signal = match signal {
             Some(s) => s,
             None => {
                 let price_change_pct = ((current_btc - start_price) / start_price * 100.0).abs();
@@ -630,9 +752,12 @@ async fn main() -> Result<()> {
             polymarket::BookData::default()
         };
 
+        // Extreme trades always use FOK (time-sensitive reversal)
+        let effective_order_type = if is_extreme_trade { "FOK" } else { &order_type };
+
         // Maker pricing for GTC: bid + 25% of spread (better than best_ask)
         // Taker (FOK): use best_ask as usual
-        let entry_price = if order_type == "GTC" && book.best_bid > 0.0 && book.best_ask > 0.0 {
+        let entry_price = if effective_order_type == "GTC" && book.best_bid > 0.0 && book.best_ask > 0.0 {
             let spread = book.best_ask - book.best_bid;
             if spread >= 0.02 {
                 let maker_price = book.best_bid + spread * 0.25;
@@ -647,8 +772,9 @@ async fn main() -> Result<()> {
         };
 
         let side_label = if signal.side == polymarket::Side::Buy { "BUY_UP" } else { "BUY_DOWN" };
+        let mode_label = if is_extreme_trade { "EXTREME" } else { "STANDARD" };
         tracing::info!(
-            "{}Placement ordre: {} {} ${:.2} @ {:.4} | BTC=${:.2} ({num_ws} src) | spread={:.4} imbal={:.2}",
+            "{}[{mode_label}] Placement ordre: {} {} ${:.2} @ {:.4} | BTC=${:.2} ({num_ws} src) | spread={:.4} imbal={:.2}",
             if dry_run { "[DRY-RUN] " } else { "" },
             side_label, token_label, signal.size_usdc, entry_price, current_btc,
             book.spread, book.imbalance,
@@ -663,18 +789,20 @@ async fn main() -> Result<()> {
                 entry_price,
                 fee_pct: signal.fee_pct,
                 implied_p_up: signal.implied_p_up,
+                is_extreme: is_extreme_trade,
             });
             (true, "dry_run")
         } else if let Some(ref poly) = poly {
             if let Some(bet) = execute_order(
                 poly, token_id, &signal, entry_price, start_price,
-                fee_rate_bps, &order_type, maker_timeout_s,
+                fee_rate_bps, effective_order_type, maker_timeout_s,
+                is_extreme_trade,
             ).await {
                 pending_bet = Some(bet);
-                let ft = if order_type == "GTC" { "GTC_filled" } else { "FOK_filled" };
+                let ft = if effective_order_type == "GTC" { "GTC_filled" } else { "FOK_filled" };
                 (true, ft)
             } else {
-                let reason = if order_type == "GTC" { "gtc_not_filled" } else { "fok_rejected" };
+                let reason = if effective_order_type == "GTC" { "gtc_not_filled" } else { "fok_rejected" };
                 tracing::warn!("Ordre {reason} — loggé comme skip");
                 if let Some(ref mut csv) = csv {
                     csv.log_skip(now, current_window, start_price, current_btc,
@@ -734,6 +862,8 @@ struct PendingBet {
     entry_price: f64,
     fee_pct: f64,
     implied_p_up: f64,
+    #[serde(default)]
+    is_extreme: bool,
 }
 
 const PENDING_BET_PATH: &str = "pending_bet.json";
@@ -870,6 +1000,7 @@ async fn execute_order(
     fee_rate_bps: u32,
     order_type: &str,
     maker_timeout_s: u64,
+    is_extreme: bool,
 ) -> Option<PendingBet> {
     let order_t = Instant::now();
     let mut gtc_immediate_fill = false;
@@ -933,6 +1064,7 @@ async fn execute_order(
             entry_price,
             fee_pct: if pays_taker_fee { signal.fee_pct } else { 0.0 },
             implied_p_up: signal.implied_p_up,
+            is_extreme,
         }
     })
 }
@@ -967,12 +1099,15 @@ fn resolve_pending_bet(
     }
 
     // Auto-calibration: record prediction and check if recalibration is due
-    let predicted_p = if bet.side == polymarket::Side::Buy {
-        bet.implied_p_up
-    } else {
-        1.0 - bet.implied_p_up
-    };
-    calibrator.record(predicted_p, won);
+    // Skip calibration for extreme trades (different probability model)
+    if !bet.is_extreme {
+        let predicted_p = if bet.side == polymarket::Side::Buy {
+            bet.implied_p_up
+        } else {
+            1.0 - bet.implied_p_up
+        };
+        calibrator.record(predicted_p, won);
+    }
 
     if calibrator.should_recalibrate() {
         if let Some((new_mult, brier)) = calibrator.recalibrate() {

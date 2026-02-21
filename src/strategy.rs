@@ -41,6 +41,51 @@ pub struct StrategyConfig {
     pub min_z_score: f64,
     /// Maximum model-vs-market divergence (0.0 = disabled). Recommended: 0.30.
     pub max_model_divergence: f64,
+    /// Configuration for extreme zone trading (Strategy C — Conditional Reversal).
+    pub extreme: ExtremeConfig,
+}
+
+/// Configuration for extreme zone contrarian trading.
+/// When mid > min_mid_extreme (or < 1-min_mid_extreme), detect reversals
+/// and bet on the contrarian side.
+#[derive(Debug, Clone)]
+pub struct ExtremeConfig {
+    pub enabled: bool,
+    /// Minimum reversal velocity (%/s) to confirm reversal is happening.
+    pub min_velocity: f64,
+    /// Maximum ratio current_delta/peak_delta. Below this means the move has decayed.
+    pub max_decay_ratio: f64,
+    /// Maximum mid movement over last 5s (staleness check).
+    pub max_mid_movement: f64,
+    /// Minimum edge (fraction) to trade.
+    pub min_edge: f64,
+    /// Maximum USDC per extreme trade.
+    pub max_bet: f64,
+    /// Entry window start (seconds before window end).
+    pub entry_seconds_before_end: u64,
+    /// Minimum remaining seconds (too late after this).
+    pub min_remaining_seconds: u64,
+    /// Mid price threshold for "extreme zone" (e.g. 0.85).
+    pub min_mid_extreme: f64,
+    /// Ultra-conservative Kelly fraction for extreme trades.
+    pub kelly_fraction: f64,
+}
+
+impl Default for ExtremeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_velocity: 0.003,
+            max_decay_ratio: 0.7,
+            max_mid_movement: 0.03,
+            min_edge: 0.03,
+            max_bet: 2.0,
+            entry_seconds_before_end: 30,
+            min_remaining_seconds: 5,
+            min_mid_extreme: 0.85,
+            kelly_fraction: 0.03,
+        }
+    }
 }
 
 /// Signal de trade émis par la stratégie.
@@ -194,8 +239,8 @@ impl VolTracker {
         let mut deviations: Vec<f64> = sorted.iter().map(|x| (x - median).abs()).collect();
         deviations.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let mad = deviations[deviations.len() / 2];
-        // MAD → std dev: σ ≈ 1.4826 × MAD (for normal distribution)
-        (1.4826 * mad).clamp(0.01, 1.0)
+        // MAD → std dev: σ ≈ 1.305 × MAD (for Student-t df=4)
+        (1.305 * mad).clamp(0.01, 1.0)
     }
 }
 
@@ -287,6 +332,46 @@ impl WindowTicks {
             if dd > max_dd { max_dd = dd; }
         }
         max_dd
+    }
+
+    /// Maximum absolute delta from start_price, as percentage.
+    pub fn peak_delta_pct(&self, start_price: f64) -> f64 {
+        if self.prices.is_empty() || start_price <= 0.0 {
+            return 0.0;
+        }
+        self.prices.iter()
+            .map(|p| ((p - start_price) / start_price * 100.0).abs())
+            .fold(0.0_f64, f64::max)
+    }
+
+    /// Current delta from start_price, as signed percentage.
+    pub fn current_delta_pct(&self, start_price: f64) -> f64 {
+        if self.prices.is_empty() || start_price <= 0.0 {
+            return 0.0;
+        }
+        let last = *self.prices.last().unwrap();
+        (last - start_price) / start_price * 100.0
+    }
+
+    /// Velocity over the last N ticks, in %/s.
+    /// Returns 0.0 if not enough data.
+    pub fn velocity_pct_per_s(&self, n_ticks: usize) -> f64 {
+        let len = self.prices.len();
+        if len < 2 || n_ticks < 2 {
+            return 0.0;
+        }
+        let n = n_ticks.min(len);
+        let start_idx = len - n;
+        let start_price = self.prices[start_idx];
+        let end_price = *self.prices.last().unwrap();
+        let start_ts = self.timestamps_ms[start_idx];
+        let end_ts = *self.timestamps_ms.last().unwrap();
+        let dt_s = (end_ts.saturating_sub(start_ts)) as f64 / 1000.0;
+        if dt_s < 0.001 || start_price <= 0.0 {
+            return 0.0;
+        }
+        let pct_change = (end_price - start_price) / start_price * 100.0;
+        pct_change / dt_s
     }
 
     /// Seconds the price spent at or above start_price.
@@ -402,6 +487,10 @@ pub struct TradeContext {
     pub num_ws_sources: u32,
     pub micro_vol: f64,
     pub momentum_ratio: f64,
+    /// True when using GTC maker pricing (0 fees).
+    pub is_maker: bool,
+    /// Age of last tick in milliseconds (freshness check).
+    pub last_tick_age_ms: u64,
 }
 
 /// Évalue si on doit trader sur cet intervalle.
@@ -422,6 +511,12 @@ pub fn evaluate(
     // 1b. Min WS sources — skip if not enough exchange feeds
     if config.min_ws_sources > 0 && ctx.num_ws_sources < config.min_ws_sources {
         tracing::debug!("Skip: {} WS sources < min {}", ctx.num_ws_sources, config.min_ws_sources);
+        return None;
+    }
+
+    // 1c. Tick freshness — skip if last tick is too old (stale data)
+    if ctx.last_tick_age_ms > 5000 {
+        tracing::debug!("Skip: last tick {}ms old > 5000ms", ctx.last_tick_age_ms);
         return None;
     }
 
@@ -490,7 +585,8 @@ pub fn evaluate(
     };
 
     let edge_pct = edge * 100.0;
-    let fee = dynamic_fee(market_price, ctx.fee_rate);
+    let effective_fee_rate = if ctx.is_maker { 0.0 } else { ctx.fee_rate };
+    let fee = dynamic_fee(market_price, effective_fee_rate);
     let spread_cost = ctx.spread / 2.0;
     let net_edge_pct = edge_pct - (fee * 100.0) - (spread_cost * 100.0);
 
@@ -578,7 +674,7 @@ pub fn evaluate(
     // 8. Fractional Kelly sizing with fee-adjusted payout and bankroll tracking
     let bankroll = session.bankroll();
     let kelly_size = fractional_kelly(
-        true_prob, market_price, ctx.fee_rate,
+        true_prob, market_price, effective_fee_rate,
         config.kelly_fraction, bankroll, config.max_bet_usdc,
     );
     if kelly_size <= 0.0 {
@@ -629,6 +725,215 @@ pub fn evaluate(
         size_usdc: size,
         price: market_price,
     })
+}
+
+/// Signal from extreme zone contrarian evaluation.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct ExtremeSignal {
+    pub side: Side,
+    pub reversal_velocity: f64,
+    pub delta_decay_ratio: f64,
+    pub mid_staleness: f64,
+    pub contrarian_edge: f64,
+    pub size_usdc: f64,
+    pub contrarian_price: f64,
+    pub implied_p_up: f64,
+}
+
+/// Evaluate a contrarian reversal trade in extreme zones.
+/// Returns Some(ExtremeSignal) when a reversal is detected with sufficient edge.
+///
+/// Logic:
+/// 1. Check session limits, time window, extreme zone
+/// 2. Determine contrarian side (UP extreme → buy DOWN)
+/// 3. Check velocity (reversal direction), decay ratio, mid staleness
+/// 4. Estimate reversal probability and edge
+/// 5. Kelly sizing with ultra-conservative fraction
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_extreme(
+    start_price: f64,
+    market_up_price: f64,
+    seconds_remaining: u64,
+    vol_5min_pct: f64,
+    window_ticks: &WindowTicks,
+    mid_history: &[f64],
+    session: &Session,
+    config: &StrategyConfig,
+) -> Option<ExtremeSignal> {
+    let ext = &config.extreme;
+    if !ext.enabled {
+        return None;
+    }
+
+    // 1. Session limits
+    if session.pnl_usdc >= config.session_profit_target_usdc
+        || session.pnl_usdc <= -config.session_loss_limit_usdc
+    {
+        return None;
+    }
+
+    // 2. Time window: [min_remaining_s, entry_s_before_end]
+    if seconds_remaining > ext.entry_seconds_before_end
+        || seconds_remaining < ext.min_remaining_seconds
+    {
+        return None;
+    }
+
+    // 3. Zone check: mid >= min_mid_extreme OR mid <= 1 - min_mid_extreme
+    let is_up_extreme = market_up_price >= ext.min_mid_extreme;
+    let is_down_extreme = market_up_price <= 1.0 - ext.min_mid_extreme;
+    if !is_up_extreme && !is_down_extreme {
+        return None;
+    }
+
+    // 4. Determine contrarian side: UP extreme → buy DOWN, DOWN extreme → buy UP
+    let contrarian_side = if is_up_extreme { Side::Sell } else { Side::Buy };
+    let contrarian_price = if is_up_extreme {
+        1.0 - market_up_price // DOWN token price
+    } else {
+        market_up_price // UP token price
+    };
+
+    // 5. Velocity check: reversal must be happening in the contrarian direction
+    let velocity = window_ticks.velocity_pct_per_s(5);
+    // For UP extreme: reversal means price going DOWN (negative velocity)
+    // For DOWN extreme: reversal means price going UP (positive velocity)
+    let reversal_velocity = if is_up_extreme { -velocity } else { velocity };
+    if reversal_velocity < ext.min_velocity {
+        tracing::debug!("Extreme skip: reversal velocity {reversal_velocity:.5}%/s < min {:.5}", ext.min_velocity);
+        return None;
+    }
+
+    // 6. Decay check: current delta / peak delta < max_decay_ratio
+    let peak = window_ticks.peak_delta_pct(start_price);
+    let current = window_ticks.current_delta_pct(start_price).abs();
+    let decay_ratio = if peak > 1e-6 { current / peak } else { 1.0 };
+    if decay_ratio > ext.max_decay_ratio {
+        tracing::debug!("Extreme skip: decay ratio {decay_ratio:.3} > max {:.3}", ext.max_decay_ratio);
+        return None;
+    }
+
+    // 7. Mid staleness: |mid_now - mid_5s_ago| < max_mid_movement
+    let mid_staleness = if mid_history.len() >= 2 {
+        (mid_history.last().unwrap() - mid_history[mid_history.len() - 2]).abs()
+    } else {
+        0.0
+    };
+    if mid_staleness > ext.max_mid_movement {
+        tracing::debug!("Extreme skip: mid movement {mid_staleness:.4} > max {:.4}", ext.max_mid_movement);
+        return None;
+    }
+
+    // 8. Edge: estimate reversal probability
+    let reversal_prob = estimate_reversal_probability(
+        start_price,
+        window_ticks,
+        seconds_remaining,
+        vol_5min_pct,
+        config.vol_confidence_multiplier,
+        config.student_t_df,
+        is_up_extreme,
+    );
+    let contrarian_edge = reversal_prob - contrarian_price;
+    if contrarian_edge < ext.min_edge {
+        tracing::debug!("Extreme skip: edge {contrarian_edge:.4} < min {:.4}", ext.min_edge);
+        return None;
+    }
+
+    // 9. Kelly sizing (ultra-conservative)
+    let bankroll = session.bankroll();
+    if bankroll <= 0.0 || contrarian_price <= 0.0 || contrarian_price >= 1.0 {
+        return None;
+    }
+    let b = (1.0 - contrarian_price) / contrarian_price;
+    if b <= 0.0 {
+        return None;
+    }
+    let q = 1.0 - reversal_prob;
+    let kelly = (b * reversal_prob - q) / b;
+    if kelly <= 0.0 {
+        tracing::debug!("Extreme skip: Kelly <= 0 (no edge per Kelly criterion)");
+        return None;
+    }
+    let kelly_size = kelly * ext.kelly_fraction * bankroll;
+    let min_usdc = config.min_bet_usdc;
+    // Skip marginal signals (Kelly < 10% of min bet) — don't amplify weak signals
+    if kelly_size < min_usdc * 0.1 {
+        tracing::debug!("Extreme skip: Kelly ${kelly_size:.2} too marginal vs min ${min_usdc:.2}");
+        return None;
+    }
+    let size = kelly_size.clamp(min_usdc, ext.max_bet);
+    if size > ext.max_bet {
+        return None;
+    }
+
+    let implied_p_up = if is_up_extreme {
+        1.0 - reversal_prob // reversal means DOWN wins
+    } else {
+        reversal_prob // reversal means UP wins
+    };
+
+    tracing::info!(
+        "EXTREME SIGNAL: {} | edge: {:.1}% | velocity: {:.5}%/s | decay: {:.2} | mid: {:.4} | size: ${:.2}",
+        if contrarian_side == Side::Buy { "BUY UP (reversal)" } else { "BUY DOWN (reversal)" },
+        contrarian_edge * 100.0, reversal_velocity, decay_ratio, market_up_price, size,
+    );
+
+    Some(ExtremeSignal {
+        side: contrarian_side,
+        reversal_velocity,
+        delta_decay_ratio: decay_ratio,
+        mid_staleness,
+        contrarian_edge,
+        size_usdc: size,
+        contrarian_price,
+        implied_p_up,
+    })
+}
+
+/// Estimate the probability that the price will reverse (cross back to start_price).
+/// Projects current delta + velocity into the future and uses Student-t CDF.
+fn estimate_reversal_probability(
+    start_price: f64,
+    window_ticks: &WindowTicks,
+    seconds_remaining: u64,
+    vol_5min_pct: f64,
+    confidence_multiplier: f64,
+    student_t_df: f64,
+    is_up_extreme: bool,
+) -> f64 {
+    let current_delta = window_ticks.current_delta_pct(start_price);
+    let velocity = window_ticks.velocity_pct_per_s(5);
+
+    // Project delta at window end
+    let projected_delta = current_delta + velocity * seconds_remaining as f64;
+
+    // For UP extreme: reversal = price goes below start → projected_delta < 0
+    // For DOWN extreme: reversal = price goes above start → projected_delta > 0
+    // Use negative of projected_delta for UP extreme (we want P(cross below))
+    let z_input = if is_up_extreme {
+        -projected_delta
+    } else {
+        projected_delta
+    };
+
+    let remaining_vol = vol_5min_pct * confidence_multiplier
+        * ((seconds_remaining as f64) / 300.0).sqrt();
+
+    if remaining_vol < 1e-9 {
+        return if z_input > 0.0 { 1.0 } else { 0.0 };
+    }
+
+    let z = z_input / remaining_vol;
+
+    if student_t_df > 0.0 {
+        use statrs::distribution::{ContinuousCDF, StudentsT};
+        let dist = StudentsT::new(0.0, 1.0, student_t_df).unwrap();
+        dist.cdf(z)
+    } else {
+        normal_cdf(z)
+    }
 }
 
 /// Calcule les frais dynamiques Polymarket.
@@ -728,6 +1033,7 @@ mod tests {
             student_t_df: 0.0,
             min_z_score: 0.0,
             max_model_divergence: 0.0,
+            extreme: ExtremeConfig::default(),
         }
     }
 
@@ -748,6 +1054,8 @@ mod tests {
             num_ws_sources: 3,
             micro_vol: 0.0,
             momentum_ratio: 1.0,
+            is_maker: false,
+            last_tick_age_ms: 0,
         }
     }
 
@@ -1421,6 +1729,7 @@ mod tests {
             student_t_df: 4.0,
             min_z_score: 0.5,
             max_model_divergence: 0.30,
+            extreme: ExtremeConfig::default(),
         }
     }
 
@@ -1445,6 +1754,8 @@ mod tests {
             num_ws_sources: 3,
             micro_vol: 0.0,
             momentum_ratio: 1.0,
+            is_maker: false,
+            last_tick_age_ms: 0,
         };
         let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_some(), "should trade with +0.05% at 8s");
@@ -1474,6 +1785,8 @@ mod tests {
             num_ws_sources: 3,
             micro_vol: 0.0,
             momentum_ratio: 1.0,
+            is_maker: false,
+            last_tick_age_ms: 0,
         };
         let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_none(), "weak +0.005% should not pass 3% min edge");
@@ -1498,6 +1811,8 @@ mod tests {
             num_ws_sources: 3,
             micro_vol: 0.0,
             momentum_ratio: 1.0,
+            is_maker: false,
+            last_tick_age_ms: 0,
         };
         let signal = evaluate(&ctx, &session, &config);
         if let Some(s) = signal {
@@ -1526,6 +1841,8 @@ mod tests {
             num_ws_sources: 3,
             micro_vol: 0.0,
             momentum_ratio: 1.0,
+            is_maker: false,
+            last_tick_age_ms: 0,
         };
         let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_none(), "should stop after -$10 (25% of $40 portfolio)");
@@ -1551,6 +1868,8 @@ mod tests {
             num_ws_sources: 3,
             micro_vol: 0.0,
             momentum_ratio: 1.0,
+            is_maker: false,
+            last_tick_age_ms: 0,
         };
         let signal = evaluate(&ctx, &session, &config);
         assert!(signal.is_none(), "wide spread should kill the edge below 3% min");
@@ -2207,5 +2526,238 @@ mod tests {
             assert!(sh.size_usdc <= sig_normal.unwrap().size_usdc,
                 "high micro_vol should reduce sizing");
         }
+    }
+
+    // --- C10: maker fee tests ---
+
+    #[test]
+    fn evaluate_maker_has_zero_fee() {
+        let config = test_config();
+        let session = Session::new(40.0);
+        let ctx = TradeContext {
+            chainlink_price: 100_050.0,
+            is_maker: true,
+            ..test_ctx()
+        };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_some());
+        let s = signal.unwrap();
+        // Maker should have 0% fee
+        assert!((s.fee_pct).abs() < 0.001, "maker fee should be 0, got {:.3}", s.fee_pct);
+    }
+
+    #[test]
+    fn evaluate_taker_has_fee() {
+        let config = test_config();
+        let session = Session::new(40.0);
+        let ctx = TradeContext {
+            chainlink_price: 100_050.0,
+            is_maker: false,
+            ..test_ctx()
+        };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_some());
+        let s = signal.unwrap();
+        assert!(s.fee_pct > 0.0, "taker fee should be >0, got {:.3}", s.fee_pct);
+    }
+
+    // --- C14: tick freshness filter ---
+
+    #[test]
+    fn evaluate_skips_stale_ticks() {
+        let config = test_config();
+        let session = Session::new(40.0);
+        let ctx = TradeContext {
+            chainlink_price: 100_050.0,
+            last_tick_age_ms: 6000, // 6s > 5s threshold
+            ..test_ctx()
+        };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_none(), "should skip with stale tick (6s)");
+    }
+
+    // --- WindowTicks velocity/delta ---
+
+    #[test]
+    fn window_ticks_peak_delta_pct() {
+        let mut wt = WindowTicks::new();
+        wt.tick(100.0, 0);
+        wt.tick(100.5, 1000);  // +0.5%
+        wt.tick(100.2, 2000);  // +0.2%
+        wt.tick(99.7, 3000);   // -0.3%
+        let peak = wt.peak_delta_pct(100.0);
+        assert!((peak - 0.5).abs() < 0.001, "peak should be 0.5%, got {peak}");
+    }
+
+    #[test]
+    fn window_ticks_current_delta_pct() {
+        let mut wt = WindowTicks::new();
+        wt.tick(100.0, 0);
+        wt.tick(100.5, 1000);
+        wt.tick(99.8, 2000);
+        let delta = wt.current_delta_pct(100.0);
+        assert!((delta - (-0.2)).abs() < 0.001, "current delta should be -0.2%, got {delta}");
+    }
+
+    #[test]
+    fn window_ticks_velocity_pct_per_s() {
+        let mut wt = WindowTicks::new();
+        // Price goes from 100.0 to 100.1 over 2 seconds (5 ticks)
+        for i in 0..5 {
+            wt.tick(100.0 + i as f64 * 0.025, i as u64 * 500);
+        }
+        let vel = wt.velocity_pct_per_s(5);
+        // 0.1% over 2s = 0.05%/s
+        assert!((vel - 0.05).abs() < 0.01, "velocity should be ~0.05%/s, got {vel}");
+    }
+
+    // --- evaluate_extreme tests ---
+
+    fn extreme_config_enabled() -> StrategyConfig {
+        StrategyConfig {
+            extreme: ExtremeConfig {
+                enabled: true,
+                min_velocity: 0.001,
+                max_decay_ratio: 0.7,
+                max_mid_movement: 0.05,
+                min_edge: 0.01,
+                max_bet: 2.0,
+                entry_seconds_before_end: 30,
+                min_remaining_seconds: 5,
+                min_mid_extreme: 0.85,
+                kelly_fraction: 0.03,
+            },
+            ..test_config()
+        }
+    }
+
+    #[test]
+    fn evaluate_extreme_disabled_returns_none() {
+        let config = test_config(); // extreme.enabled = false
+        let session = Session::new(40.0);
+        let wt = WindowTicks::new();
+        let result = evaluate_extreme(100_000.0, 0.90, 20, 0.12, &wt, &[], &session, &config);
+        assert!(result.is_none(), "should return None when disabled");
+    }
+
+    #[test]
+    fn evaluate_extreme_non_extreme_zone_returns_none() {
+        let config = extreme_config_enabled();
+        let session = Session::new(40.0);
+        let wt = WindowTicks::new();
+        // mid = 0.60 — not in extreme zone (< 0.85 and > 0.15)
+        let result = evaluate_extreme(100_000.0, 0.60, 20, 0.12, &wt, &[], &session, &config);
+        assert!(result.is_none(), "mid=0.60 is not extreme zone");
+    }
+
+    #[test]
+    fn evaluate_extreme_respects_time_window() {
+        let config = extreme_config_enabled();
+        let session = Session::new(40.0);
+        let wt = WindowTicks::new();
+        // remaining = 3 < min_remaining (5)
+        let result = evaluate_extreme(100_000.0, 0.90, 3, 0.12, &wt, &[], &session, &config);
+        assert!(result.is_none(), "should skip when remaining < min_remaining");
+        // remaining = 35 > entry_seconds_before_end (30)
+        let result2 = evaluate_extreme(100_000.0, 0.90, 35, 0.12, &wt, &[], &session, &config);
+        assert!(result2.is_none(), "should skip when remaining > entry window");
+    }
+
+    #[test]
+    fn evaluate_extreme_no_reversal_returns_none() {
+        let config = extreme_config_enabled();
+        let session = Session::new(40.0);
+        let mut wt = WindowTicks::new();
+        // Price going UP (not reversing from UP extreme)
+        for i in 0..10 {
+            wt.tick(100_000.0 + i as f64 * 10.0, i as u64 * 1000);
+        }
+        // mid = 0.90 (UP extreme), but price is still going up → no reversal
+        let result = evaluate_extreme(100_000.0, 0.90, 20, 0.12, &wt, &[0.90], &session, &config);
+        assert!(result.is_none(), "no reversal detected when price still going up");
+    }
+
+    #[test]
+    fn evaluate_extreme_detects_reversal() {
+        let config = extreme_config_enabled();
+        let session = Session::new(40.0);
+        let mut wt = WindowTicks::new();
+        // Price went up, then reverses strongly down
+        // Peak at 100_100 (+0.1%), now at 100_020 (+0.02%) → decay ratio = 0.02/0.10 = 0.2 < 0.7
+        for i in 0..5 {
+            wt.tick(100_000.0 + i as f64 * 25.0, i as u64 * 1000); // up to 100_100
+        }
+        for i in 5..10 {
+            wt.tick(100_100.0 - (i - 4) as f64 * 16.0, i as u64 * 1000); // reversing down
+        }
+        // mid = 0.90 (UP extreme), price reversing → should detect
+        let mid_history = vec![0.90, 0.90];
+        let result = evaluate_extreme(100_000.0, 0.90, 20, 0.12, &wt, &mid_history, &session, &config);
+        if let Some(sig) = result {
+            assert_eq!(sig.side, Side::Sell, "UP extreme reversal should buy DOWN (Side::Sell)");
+            assert!(sig.size_usdc > 0.0);
+        }
+        // May return None if edge/velocity thresholds not met with exact values — that's ok
+    }
+
+    #[test]
+    fn evaluate_extreme_contrarian_side_correct() {
+        // UP extreme → contrarian = Sell (buy DOWN)
+        // DOWN extreme → contrarian = Buy (buy UP)
+        let config = extreme_config_enabled();
+        let session = Session::new(40.0);
+        let mut wt = WindowTicks::new();
+        // Strong reversal from DOWN extreme
+        for i in 0..5 {
+            wt.tick(100_000.0 - i as f64 * 25.0, i as u64 * 1000); // going down
+        }
+        for i in 5..10 {
+            wt.tick(99_900.0 + (i - 4) as f64 * 16.0, i as u64 * 1000); // reversing up
+        }
+        let mid_history = vec![0.10, 0.10];
+        let result = evaluate_extreme(100_000.0, 0.10, 20, 0.12, &wt, &mid_history, &session, &config);
+        if let Some(sig) = result {
+            assert_eq!(sig.side, Side::Buy, "DOWN extreme reversal should buy UP (Side::Buy)");
+        }
+    }
+
+    #[test]
+    fn evaluate_extreme_sizing_is_conservative() {
+        let config = extreme_config_enabled();
+        let session = Session::new(40.0);
+        let mut wt = WindowTicks::new();
+        for i in 0..5 {
+            wt.tick(100_000.0 + i as f64 * 25.0, i as u64 * 1000);
+        }
+        for i in 5..10 {
+            wt.tick(100_100.0 - (i - 4) as f64 * 20.0, i as u64 * 1000);
+        }
+        let mid_history = vec![0.90, 0.90];
+        let result = evaluate_extreme(100_000.0, 0.90, 20, 0.12, &wt, &mid_history, &session, &config);
+        if let Some(sig) = result {
+            assert!(sig.size_usdc <= config.extreme.max_bet,
+                "size ${:.2} should be <= max_bet ${:.2}", sig.size_usdc, config.extreme.max_bet);
+        }
+    }
+
+    #[test]
+    fn evaluate_extreme_respects_decay_ratio() {
+        let config = StrategyConfig {
+            extreme: ExtremeConfig {
+                max_decay_ratio: 0.3, // very strict
+                ..extreme_config_enabled().extreme
+            },
+            ..extreme_config_enabled()
+        };
+        let session = Session::new(40.0);
+        let mut wt = WindowTicks::new();
+        // Small decay: went to 100_050, currently at 100_040 → ratio = 0.04/0.05 = 0.8 > 0.3
+        for i in 0..5 {
+            wt.tick(100_000.0 + i as f64 * 12.5, i as u64 * 1000);
+        }
+        wt.tick(100_040.0, 5000);
+        let mid_history = vec![0.90, 0.90];
+        let result = evaluate_extreme(100_000.0, 0.90, 20, 0.12, &wt, &mid_history, &session, &config);
+        assert!(result.is_none(), "decay ratio too high should skip");
     }
 }

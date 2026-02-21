@@ -1,4 +1,4 @@
-use crate::strategy::StrategyConfig;
+use crate::strategy::{ExtremeConfig, StrategyConfig};
 
 /// Returns the "Sniper Conservateur" preset.
 /// GTC maker, edge>=3%, kelly=0.10, vol<0.08%.
@@ -23,7 +23,7 @@ pub fn sniper() -> StrategyConfig {
         min_payout_ratio: 0.10,
         min_book_imbalance: 0.08,
         max_vol_5min_pct: 0.08,
-        min_ws_sources: 2,
+        min_ws_sources: 1,
         circuit_breaker_window: 10,
         circuit_breaker_min_wr: 0.30,
         circuit_breaker_cooldown_s: 900,
@@ -32,6 +32,7 @@ pub fn sniper() -> StrategyConfig {
         student_t_df: 4.0,
         min_z_score: 0.5,
         max_model_divergence: 0.30,
+        extreme: ExtremeConfig::default(),
     }
 }
 
@@ -58,7 +59,7 @@ pub fn conviction() -> StrategyConfig {
         min_payout_ratio: 0.15,
         min_book_imbalance: 0.15,
         max_vol_5min_pct: 0.07,
-        min_ws_sources: 2,
+        min_ws_sources: 1,
         circuit_breaker_window: 8,
         circuit_breaker_min_wr: 0.30,
         circuit_breaker_cooldown_s: 1200,
@@ -67,6 +68,7 @@ pub fn conviction() -> StrategyConfig {
         student_t_df: 4.0,
         min_z_score: 0.5,
         max_model_divergence: 0.30,
+        extreme: ExtremeConfig::default(),
     }
 }
 
@@ -93,7 +95,7 @@ pub fn scalper() -> StrategyConfig {
         min_payout_ratio: 0.05,
         min_book_imbalance: 0.05,
         max_vol_5min_pct: 0.10,
-        min_ws_sources: 2,
+        min_ws_sources: 1,
         circuit_breaker_window: 15,
         circuit_breaker_min_wr: 0.40,
         circuit_breaker_cooldown_s: 600,
@@ -102,6 +104,7 @@ pub fn scalper() -> StrategyConfig {
         student_t_df: 4.0,
         min_z_score: 0.5,
         max_model_divergence: 0.30,
+        extreme: ExtremeConfig::default(),
     }
 }
 
@@ -137,11 +140,59 @@ pub fn farm() -> StrategyConfig {
         student_t_df: 0.0,
         min_z_score: 0.0,
         max_model_divergence: 0.0,
+        extreme: ExtremeConfig::default(),
+    }
+}
+
+/// Returns the "Extreme Reversal" preset.
+/// Contrarian trading in extreme zones with reversal detection enabled.
+pub fn extreme() -> StrategyConfig {
+    StrategyConfig {
+        max_bet_usdc: 3.0,
+        min_bet_usdc: 1.0,
+        min_shares: 5,
+        min_edge_pct: 3.0,
+        entry_seconds_before_end: 8,
+        session_profit_target_usdc: 15.0,
+        session_loss_limit_usdc: 10.0,
+        fee_rate: 0.25,
+        min_market_price: 0.25,
+        max_market_price: 0.75,
+        min_delta_pct: 0.008,
+        max_spread: 0.04,
+        kelly_fraction: 0.10,
+        initial_bankroll_usdc: 40.0,
+        always_trade: false,
+        vol_confidence_multiplier: 1.0,
+        min_payout_ratio: 0.10,
+        min_book_imbalance: 0.08,
+        max_vol_5min_pct: 0.08,
+        min_ws_sources: 1,
+        circuit_breaker_window: 10,
+        circuit_breaker_min_wr: 0.30,
+        circuit_breaker_cooldown_s: 900,
+        min_implied_prob: 0.75,
+        max_consecutive_losses: 6,
+        student_t_df: 4.0,
+        min_z_score: 0.5,
+        max_model_divergence: 0.30,
+        extreme: ExtremeConfig {
+            enabled: true,
+            min_velocity: 0.003,
+            max_decay_ratio: 0.7,
+            max_mid_movement: 0.03,
+            min_edge: 0.03,
+            max_bet: 2.0,
+            entry_seconds_before_end: 30,
+            min_remaining_seconds: 5,
+            min_mid_extreme: 0.85,
+            kelly_fraction: 0.03,
+        },
     }
 }
 
 /// Display the interactive profile menu and return the selected profile name.
-/// Returns None if stdin is not a TTY or user chose Custom (option 5).
+/// Returns None if stdin is not a TTY or user chose Custom (option 6).
 pub fn interactive_menu() -> Option<&'static str> {
     use std::io::{self, BufRead, Write};
 
@@ -156,9 +207,10 @@ pub fn interactive_menu() -> Option<&'static str> {
     println!("  2. High Conviction Only  (GTC maker, edge>=5%, kelly=0.15, imbal>=0.15)");
     println!("  3. Extreme Zones Scalper (FOK taker, edge>=1%, mid 0.10-0.90, prob>=0.85)");
     println!("  4. Data Farm [dry-run]   (FOK, filtres relâchés, collecte de données)");
-    println!("  5. Custom (config.toml)  (utiliser la config [strategy] du fichier)");
+    println!("  5. Extreme Reversal      (standard + contrarian reversal in extreme zones)");
+    println!("  6. Custom (config.toml)  (utiliser la config [strategy] du fichier)");
     println!();
-    print!("Choix [1-5]: ");
+    print!("Choix [1-6]: ");
     io::stdout().flush().ok();
 
     let stdin = io::stdin();
@@ -168,6 +220,7 @@ pub fn interactive_menu() -> Option<&'static str> {
         "2" => Some("conviction"),
         "3" => Some("scalper"),
         "4" => Some("farm"),
+        "5" => Some("extreme"),
         _ => None,
     }
 }
@@ -179,6 +232,7 @@ pub fn get(name: &str) -> Option<StrategyConfig> {
         "conviction" => Some(conviction()),
         "scalper" => Some(scalper()),
         "farm" => Some(farm()),
+        "extreme" => Some(extreme()),
         _ => None,
     }
 }
@@ -194,6 +248,7 @@ mod tests {
             ("conviction", conviction()),
             ("scalper", scalper()),
             ("farm", farm()),
+            ("extreme", extreme()),
         ] {
             assert!(config.max_bet_usdc > 0.0, "{name}: max_bet must be positive");
             assert!(config.min_market_price < config.max_market_price,
@@ -210,6 +265,7 @@ mod tests {
         assert!(get("conviction").is_some());
         assert!(get("scalper").is_some());
         assert!(get("farm").is_some());
+        assert!(get("extreme").is_some());
         assert!(get("unknown").is_none());
     }
 
@@ -228,5 +284,13 @@ mod tests {
         assert!(s.kelly_fraction <= 0.10);
         assert!(s.min_edge_pct >= 3.0);
         assert!(s.vol_confidence_multiplier >= 1.0);
+    }
+
+    #[test]
+    fn extreme_preset_has_extreme_enabled() {
+        let e = extreme();
+        assert!(e.extreme.enabled, "extreme preset should have extreme.enabled = true");
+        assert!(e.extreme.min_mid_extreme >= 0.80, "extreme zone threshold should be >= 0.80");
+        assert!(e.extreme.kelly_fraction <= 0.05, "extreme kelly should be ultra-conservative");
     }
 }

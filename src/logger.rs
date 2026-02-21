@@ -178,18 +178,29 @@ impl OutcomeLogger {
         let needs_header = file.metadata().map(|m| m.len() == 0).unwrap_or(true);
         let mut writer = BufWriter::new(file);
         if needs_header {
-            writeln!(writer, "window,btc_start,btc_end,went_up,price_change_bps")?;
+            writeln!(writer, "window,btc_start,btc_end,went_up,price_change_bps,delta_peak_pct,velocity_last_5s,ticks_in_window,mid_at_eval,reversal_detected")?;
             writer.flush()?;
         }
         Ok(Self { writer })
     }
 
-    pub fn log_outcome(&mut self, window: u64, btc_start: f64, btc_end: f64) {
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_outcome(
+        &mut self,
+        window: u64,
+        btc_start: f64,
+        btc_end: f64,
+        delta_peak_pct: f64,
+        velocity_last_5s: f64,
+        ticks_in_window: u32,
+        mid_at_eval: f64,
+        reversal_detected: bool,
+    ) {
         let went_up = btc_end >= btc_start;
         let change_bps = if btc_start > 0.0 { (btc_end - btc_start) / btc_start * 10000.0 } else { 0.0 };
         if let Err(e) = writeln!(
             self.writer,
-            "{window},{btc_start:.2},{btc_end:.2},{went_up},{change_bps:.2}"
+            "{window},{btc_start:.2},{btc_end:.2},{went_up},{change_bps:.2},{delta_peak_pct:.4},{velocity_last_5s:.6},{ticks_in_window},{mid_at_eval:.4},{reversal_detected}"
         ).and_then(|_| self.writer.flush()) {
             tracing::warn!("Outcome CSV write error: {e}");
         }
@@ -385,13 +396,14 @@ mod tests {
         let path = "/tmp/poly5m_test_outcomes.csv";
         let _ = std::fs::remove_file(path);
         let mut logger = super::OutcomeLogger::new(path).unwrap();
-        logger.log_outcome(1699999800, 97150.0, 97155.0);
+        logger.log_outcome(1699999800, 97150.0, 97155.0, 0.01, 0.001, 50, 0.55, false);
         drop(logger);
 
         let content = std::fs::read_to_string(path).unwrap();
         let lines: Vec<&str> = content.trim().lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("window,btc_start,"));
+        assert!(lines[0].contains("delta_peak_pct"));
         assert!(lines[1].contains("1699999800"));
         assert!(lines[1].contains("true"));
         std::fs::remove_file(path).ok();
@@ -403,11 +415,11 @@ mod tests {
         let _ = std::fs::remove_file(path);
         {
             let mut logger = super::OutcomeLogger::new(path).unwrap();
-            logger.log_outcome(1699999800, 97150.0, 97155.0);
+            logger.log_outcome(1699999800, 97150.0, 97155.0, 0.01, 0.001, 50, 0.55, false);
         }
         {
             let mut logger = super::OutcomeLogger::new(path).unwrap();
-            logger.log_outcome(1700000100, 97155.0, 97140.0);
+            logger.log_outcome(1700000100, 97155.0, 97140.0, 0.02, -0.001, 60, 0.45, true);
         }
         let content = std::fs::read_to_string(path).unwrap();
         let lines: Vec<&str> = content.trim().lines().collect();
