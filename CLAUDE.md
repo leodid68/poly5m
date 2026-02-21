@@ -17,7 +17,7 @@ Polymarket utilise Chainlink Data Streams (pull-based, sub-seconde) pour résoud
 │  Chainlink   │──┼─▶│   Strategy       │────▶│   Polymarket     │
 │  (on-chain)  │  │  │   (décision)     │     │   (ordres)       │
 └──────────────┘  │  │                  │     │                  │
-┌──────────────┐  │  │ hybrid z+book    │     │ CLOB API         │
+┌──────────────┐  │  │ pure z-score     │     │ CLOB API         │
 │  RTDS        │──┘  │ Student-t CDF    │     │ EIP-712 signing  │
 │  (Polymarket │     │ half-Kelly size  │     │ FOK/GTC orders   │
 │   live data) │     │ session limits   │     │ maker pricing    │
@@ -75,21 +75,20 @@ Le bot fusionne 3 sources de prix :
 
 `fetch_racing()` lance des appels simultanés vers tous les RPC providers et prend la première réponse. Utilise `futures::select_ok`.
 
-### Modèle de probabilité hybride (strategy.rs)
+### Modèle de probabilité pure z-score (strategy.rs)
 
 ```
 vol_résiduelle = vol_dynamique × √(seconds_remaining / 300) × vol_confidence_multiplier
 z = price_change_pct / vol_résiduelle
 
-# Blend z-score + book imbalance (30% book weight)
-z_blended = z × 0.7 + book_signal × 0.3
-
-probabilité_UP = Student_t_CDF(z_blended, df=4.0)
+probabilité_UP = Student_t_CDF(z, df=4.0)
 ```
 
 - **Vol dynamique** : `VolTracker` calcule la MAD (Median Absolute Deviation) sur les derniers N intervalles
 - **Student-t CDF** : queues lourdes (df=4.0), plus conservateur que la CDF normale
-- **Book imbalance** : (bid_depth - ask_depth) / (bid_depth + ask_depth), pondéré à 30%
+- **Z-threshold filter** : skip si |z| < `min_z_score` (défaut 0.5) — bruit, pas signal
+- **Model-market divergence** : skip si |model_prob - market_price| > `max_model_divergence` (défaut 0.30)
+- **Book imbalance** : utilisé uniquement comme filtre (min_book_imbalance), PAS dans le modèle de probabilité
 - **Regime detection** : `WindowTicks` filtre les marchés choppants (micro-vol, momentum ratio)
 
 ### Sizing demi-Kelly (strategy.rs)

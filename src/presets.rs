@@ -19,7 +19,7 @@ pub fn sniper() -> StrategyConfig {
         kelly_fraction: 0.10,
         initial_bankroll_usdc: 40.0,
         always_trade: false,
-        vol_confidence_multiplier: 4.0,
+        vol_confidence_multiplier: 1.0,
         min_payout_ratio: 0.10,
         min_book_imbalance: 0.08,
         max_vol_5min_pct: 0.08,
@@ -30,6 +30,8 @@ pub fn sniper() -> StrategyConfig {
         min_implied_prob: 0.75,
         max_consecutive_losses: 6,
         student_t_df: 4.0,
+        min_z_score: 0.5,
+        max_model_divergence: 0.30,
     }
 }
 
@@ -52,7 +54,7 @@ pub fn conviction() -> StrategyConfig {
         kelly_fraction: 0.15,
         initial_bankroll_usdc: 40.0,
         always_trade: false,
-        vol_confidence_multiplier: 3.5,
+        vol_confidence_multiplier: 1.0,
         min_payout_ratio: 0.15,
         min_book_imbalance: 0.15,
         max_vol_5min_pct: 0.07,
@@ -63,6 +65,8 @@ pub fn conviction() -> StrategyConfig {
         min_implied_prob: 0.80,
         max_consecutive_losses: 5,
         student_t_df: 4.0,
+        min_z_score: 0.5,
+        max_model_divergence: 0.30,
     }
 }
 
@@ -85,7 +89,7 @@ pub fn scalper() -> StrategyConfig {
         kelly_fraction: 0.20,
         initial_bankroll_usdc: 40.0,
         always_trade: false,
-        vol_confidence_multiplier: 3.0,
+        vol_confidence_multiplier: 1.0,
         min_payout_ratio: 0.05,
         min_book_imbalance: 0.05,
         max_vol_5min_pct: 0.10,
@@ -96,6 +100,8 @@ pub fn scalper() -> StrategyConfig {
         min_implied_prob: 0.85,
         max_consecutive_losses: 6,
         student_t_df: 4.0,
+        min_z_score: 0.5,
+        max_model_divergence: 0.30,
     }
 }
 
@@ -118,7 +124,7 @@ pub fn farm() -> StrategyConfig {
         kelly_fraction: 0.25,
         initial_bankroll_usdc: 40.0,
         always_trade: false,
-        vol_confidence_multiplier: 2.5,
+        vol_confidence_multiplier: 1.0,
         min_payout_ratio: 0.0,
         min_book_imbalance: 0.0,
         max_vol_5min_pct: 0.0,
@@ -129,6 +135,8 @@ pub fn farm() -> StrategyConfig {
         min_implied_prob: 0.0,
         max_consecutive_losses: 0,
         student_t_df: 0.0,
+        min_z_score: 0.0,
+        max_model_divergence: 0.0,
     }
 }
 
@@ -219,6 +227,6 @@ mod tests {
         let s = sniper();
         assert!(s.kelly_fraction <= 0.10);
         assert!(s.min_edge_pct >= 3.0);
-        assert!(s.vol_confidence_multiplier >= 4.0);
+        assert!(s.vol_confidence_multiplier >= 1.0);
     }
 }

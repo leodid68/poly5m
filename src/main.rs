@@ -145,6 +145,10 @@ struct StrategyToml {
     max_consecutive_losses: u32,
     #[serde(default = "default_student_t_df")]
     student_t_df: f64,
+    #[serde(default = "default_min_z_score")]
+    min_z_score: f64,
+    #[serde(default = "default_max_model_divergence")]
+    max_model_divergence: f64,
 }
 
 fn default_min_bet_usdc() -> f64 { 1.0 }
@@ -160,10 +164,12 @@ fn default_maker_timeout() -> u64 { 5 }
 fn default_max_spread() -> f64 { 0.0 }
 fn default_kelly_fraction() -> f64 { 0.10 }
 fn default_initial_bankroll() -> f64 { 40.0 }
-fn default_vol_confidence_multiplier() -> f64 { 4.0 }
+fn default_vol_confidence_multiplier() -> f64 { 1.0 }
 fn default_circuit_breaker_window() -> usize { 0 }
 fn default_circuit_breaker_cooldown() -> u64 { 1800 }
 fn default_student_t_df() -> f64 { 4.0 }
+fn default_min_z_score() -> f64 { 0.5 }
+fn default_max_model_divergence() -> f64 { 0.30 }
 
 impl From<StrategyToml> for strategy::StrategyConfig {
     fn from(s: StrategyToml) -> Self {
@@ -194,6 +200,8 @@ impl From<StrategyToml> for strategy::StrategyConfig {
             min_implied_prob: s.min_implied_prob,
             max_consecutive_losses: s.max_consecutive_losses,
             student_t_df: s.student_t_df,
+            min_z_score: s.min_z_score,
+            max_model_divergence: s.max_model_divergence,
         }
     }
 }
@@ -403,6 +411,7 @@ async fn main() -> Result<()> {
     let mut macro_ctx = macro_data::MacroData::default();
     let mut window_ticks = strategy::WindowTicks::new();
     let mut calibrator = strategy::Calibrator::new(200);
+    calibrator.set_current_vcm(strat_config.vol_confidence_multiplier);
 
     // Load saved calibration if available (not when using a preset)
     if profile_name.is_none() {
@@ -412,6 +421,7 @@ async fn main() -> Result<()> {
                     tracing::info!("Loaded calibration: vcm={mult:.2} (brier={:.4})",
                         cal_data["brier_score"].as_f64().unwrap_or(0.0));
                     strat_config.vol_confidence_multiplier = mult;
+                    calibrator.set_current_vcm(mult);
                 }
             }
         }
@@ -935,6 +945,7 @@ fn resolve_pending_bet(
             tracing::info!("Auto-calibration: vcm {:.2} → {:.2} (brier={:.4})",
                 strat_config.vol_confidence_multiplier, new_mult, brier);
             strat_config.vol_confidence_multiplier = new_mult;
+            calibrator.set_current_vcm(new_mult);
             let cal_json = serde_json::json!({
                 "vol_confidence_multiplier": new_mult,
                 "brier_score": brier,
