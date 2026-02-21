@@ -101,7 +101,7 @@ size = (kelly / 2) × bankroll × kelly_fraction
 
 ### Session et risk management (strategy.rs)
 
-- **Session** : tracking PnL, win rate, consecutive wins/losses, drawdown
+- **Session** : tracking PnL, win rate, consecutive wins/losses, drawdown. Persisté dans `session.json` entre redémarrages.
 - **Circuit breaker** : pause si rolling WR < seuil sur N derniers trades
 - **Max consecutive losses** : arrêt après N pertes consécutives
 - **Profit target / loss limit** : arrêt de session sur seuils
@@ -227,7 +227,7 @@ Format : `btc-updown-5m-{unix_timestamp_du_window}`
 - Logging : `tracing` (info/warn/error/debug), pas println
 - Async : `tokio` multi-thread, pas de `.block_on()`
 - Serde : `#[serde(rename_all = "camelCase")]` pour les réponses API Polymarket
-- Tests : dans `#[cfg(test)] mod tests` en bas de chaque fichier — 144 tests actuellement
+- Tests : dans `#[cfg(test)] mod tests` en bas de chaque fichier — 151 tests actuellement
 - Config : `serde::Deserialize` depuis `config.toml`, converteurs `From<>` vers les structs internes
 - NaN safety : `partial_cmp().unwrap_or(Ordering::Equal)` dans les sorts
 - Break-even (pnl == 0.0) traité comme une perte (reset win streak)

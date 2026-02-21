@@ -4,3 +4,5 @@ config.toml
 *.key
 __pycache__/
 calibration.json
+session.json
+pending_bet.json

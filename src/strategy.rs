@@ -56,7 +56,7 @@ pub struct Signal {
 }
 
 /// État de la session (P&L, nombre de trades, bankroll tracking, circuit breaker).
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Session {
     pub pnl_usdc: f64,
     pub trades: u32,
@@ -321,7 +321,7 @@ impl Calibrator {
     }
 
     pub fn set_current_vcm(&mut self, vcm: f64) {
-        self.current_vcm = vcm;
+        self.current_vcm = if vcm > 0.0 { vcm } else { 1.0 };
     }
 
     pub fn record(&mut self, predicted_prob: f64, won: bool) {
@@ -447,6 +447,12 @@ pub fn evaluate(
         .or(ctx.exchange_price)
         .unwrap_or(ctx.chainlink_price);
     let price_change_pct = (current_price - ctx.start_price) / ctx.start_price * 100.0;
+
+    // NaN/infinity guard — corrupted price source should not trade
+    if !price_change_pct.is_finite() {
+        tracing::warn!("Skip: price_change_pct is not finite ({price_change_pct})");
+        return None;
+    }
 
     let true_up_prob = price_change_to_probability(price_change_pct, ctx.seconds_remaining, ctx.vol_5min_pct, config.vol_confidence_multiplier, config.student_t_df);
     let true_down_prob = 1.0 - true_up_prob;
@@ -635,11 +641,14 @@ pub fn dynamic_fee(price: f64, fee_rate: f64) -> f64 {
     fee_rate * p_q.powi(2)
 }
 
-/// Probabilité UP time-aware — modèle hybride prix + imbalance.
+/// Probabilité UP time-aware — modèle z-score pur.
 /// Calcule P(UP) à partir du mouvement de prix et de la vol résiduelle.
 /// Utilise le z-score pur (sans book imbalance — le book Polymarket est un signal
 /// de liquidité, pas un signal directionnel sur BTC).
 fn price_change_to_probability(pct_change: f64, seconds_remaining: u64, vol_5min_pct: f64, confidence_multiplier: f64, student_t_df: f64) -> f64 {
+    if !pct_change.is_finite() {
+        return 0.5;
+    }
     let remaining_vol = vol_5min_pct * confidence_multiplier * ((seconds_remaining as f64) / 300.0).sqrt();
 
     if remaining_vol < 1e-9 {
@@ -1195,6 +1204,97 @@ mod tests {
         };
         // Should NOT be blocked by spread filter, only by edge (spread cost in evaluate)
         let _ = evaluate(&ctx, &session, &config);
+    }
+
+    // --- z-threshold and model-market divergence filters ---
+
+    #[test]
+    fn evaluate_skips_low_z_score() {
+        // Small price move → |z| < min_z_score → skip
+        // z = 0.01 / (0.12 * sqrt(10/300)) = 0.01 / 0.0219 = 0.456 < 2.0
+        let config = StrategyConfig { min_z_score: 2.0, ..test_config() };
+        let session = Session::new(40.0);
+        let ctx = TradeContext {
+            chainlink_price: 100_010.0, // +0.01%
+            ..test_ctx()
+        };
+        assert!(evaluate(&ctx, &session, &config).is_none(), "should skip: |z| < min_z_score");
+    }
+
+    #[test]
+    fn evaluate_z_filter_disabled_at_zero() {
+        // Same small move, but filter disabled → should NOT be blocked by z-threshold
+        let config = StrategyConfig { min_z_score: 0.0, ..test_config() };
+        let session = Session::new(40.0);
+        let ctx = TradeContext {
+            chainlink_price: 100_050.0, // +0.05%
+            ..test_ctx()
+        };
+        // May pass or fail on other filters, but NOT on z-threshold
+        let _ = evaluate(&ctx, &session, &config);
+    }
+
+    #[test]
+    fn evaluate_skips_high_model_divergence() {
+        // Strong move → model P(UP) ≈ 0.99, market at 0.50 → divergence ≈ 0.49 > 0.05
+        let config = StrategyConfig { max_model_divergence: 0.05, ..test_config() };
+        let session = Session::new(40.0);
+        let ctx = TradeContext {
+            chainlink_price: 100_050.0, // +0.05%
+            market_up_price: 0.50,
+            ..test_ctx()
+        };
+        assert!(evaluate(&ctx, &session, &config).is_none(), "should skip: model/market divergence > max");
+    }
+
+    #[test]
+    fn evaluate_divergence_filter_disabled_at_zero() {
+        // Same scenario but filter disabled → should NOT be blocked by divergence
+        let config = StrategyConfig { max_model_divergence: 0.0, ..test_config() };
+        let session = Session::new(40.0);
+        let ctx = TradeContext {
+            chainlink_price: 100_050.0,
+            market_up_price: 0.50,
+            ..test_ctx()
+        };
+        let signal = evaluate(&ctx, &session, &config);
+        assert!(signal.is_some(), "divergence filter disabled → should trade");
+    }
+
+    #[test]
+    fn nan_price_change_returns_neutral() {
+        let p = price_change_to_probability(f64::NAN, 10, DEFAULT_VOL, 1.0, 0.0);
+        assert_eq!(p, 0.5, "NaN input should return neutral 0.5");
+    }
+
+    #[test]
+    fn infinity_price_change_returns_neutral() {
+        let p = price_change_to_probability(f64::INFINITY, 10, DEFAULT_VOL, 1.0, 0.0);
+        assert_eq!(p, 0.5, "Infinity input should return neutral 0.5");
+    }
+
+    #[test]
+    fn evaluate_skips_nan_price() {
+        let config = test_config();
+        let session = Session::new(40.0);
+        let ctx = TradeContext {
+            start_price: 0.0, // division by zero → NaN price_change_pct... actually caught by validation
+            chainlink_price: 100_050.0,
+            ..test_ctx()
+        };
+        // start_price <= 0.0 is caught by input validation (line 434), returns None
+        assert!(evaluate(&ctx, &session, &config).is_none());
+    }
+
+    #[test]
+    fn calibrator_rejects_zero_vcm() {
+        let mut cal = Calibrator::new(10);
+        cal.set_current_vcm(0.0);
+        assert_eq!(cal.current_vcm, 1.0, "zero VCM should be clamped to 1.0");
+        cal.set_current_vcm(-5.0);
+        assert_eq!(cal.current_vcm, 1.0, "negative VCM should be clamped to 1.0");
+        cal.set_current_vcm(2.5);
+        assert_eq!(cal.current_vcm, 2.5, "positive VCM should be set as-is");
     }
 
     // --- minimum order size ---

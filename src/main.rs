@@ -394,7 +394,7 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(3))
         .build()?;
 
-    let mut session = strategy::Session::new(strat_config.initial_bankroll_usdc);
+    let mut session = load_session(strat_config.initial_bankroll_usdc);
     let mut vol_tracker = strategy::VolTracker::new(vol_lookback, default_vol);
     let mut interval = time::interval(Duration::from_millis(poll_ms));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -737,6 +737,7 @@ struct PendingBet {
 }
 
 const PENDING_BET_PATH: &str = "pending_bet.json";
+const SESSION_PATH: &str = "session.json";
 
 fn load_pending_bet() -> Option<PendingBet> {
     let content = std::fs::read_to_string(PENDING_BET_PATH).ok()?;
@@ -759,6 +760,38 @@ fn save_pending_bet(bet: &PendingBet) {
             }
         }
         Err(e) => tracing::error!("Failed to serialize pending bet: {e}"),
+    }
+}
+
+fn load_session(initial_bankroll: f64) -> strategy::Session {
+    match std::fs::read_to_string(SESSION_PATH) {
+        Ok(content) => {
+            match serde_json::from_str::<strategy::Session>(&content) {
+                Ok(s) => {
+                    tracing::info!(
+                        "Loaded session from {SESSION_PATH}: PnL=${:.2}, trades={}, WR={:.0}%, consec_losses={}",
+                        s.pnl_usdc, s.trades, s.win_rate() * 100.0, s.consecutive_losses,
+                    );
+                    s
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to parse {SESSION_PATH}: {e} — starting fresh session");
+                    strategy::Session::new(initial_bankroll)
+                }
+            }
+        }
+        Err(_) => strategy::Session::new(initial_bankroll),
+    }
+}
+
+fn save_session(session: &strategy::Session) {
+    match serde_json::to_string(session) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(SESSION_PATH, &json) {
+                tracing::error!("Failed to save session: {e}");
+            }
+        }
+        Err(e) => tracing::error!("Failed to serialize session: {e}"),
     }
 }
 
@@ -921,6 +954,7 @@ fn resolve_pending_bet(
         || (!went_up && bet.side != polymarket::Side::Buy);
     let pnl = compute_pnl(won, bet.size_usdc, bet.entry_price, bet.fee_pct);
     session.record_trade(pnl);
+    save_session(session);
     let result_str = if won { "WIN" } else { "LOSS" };
     tracing::info!(
         "Résolution: {} | PnL: ${:.2} | Session: ${:.2} | WR: {:.0}%",
